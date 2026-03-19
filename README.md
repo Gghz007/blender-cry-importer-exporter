@@ -18,6 +18,7 @@ Ported from the original [CryImporter for 3ds Max 8](https://www.takaro.net) by 
 - Vertex weights (skinning) for character models
 - Shape keys (morph targets / facial expressions)
 - Full animation support: CryBone, Linear, Bezier, TCB controller types (v826 and v827)
+- **Auto-import:** when opening CAF or CAL, the CGF is found and imported automatically
 - Correct scale conversion: Max inches → Blender meters (`× 0.0254`) applied to geometry AND animation
 - Supports Blender 4.0, 4.1, 4.2, 5.0+
 
@@ -34,9 +35,19 @@ Ported from the original [CryImporter for 3ds Max 8](https://www.takaro.net) by 
 
 ## Usage
 
-### Geometry
+### Importing geometry — CGF / CGA
 
 **File → Import → CryEngine Geometry (.cgf, .cga)**
+
+Just select the file and import. No preparation needed.
+
+**Required file layout:**
+```
+any_folder/
+├── model.cgf       ← select this
+├── texture.dds     ← textures should be in the same folder (or subfolders)
+└── texture2.dds
+```
 
 | Option | Description |
 |---|---|
@@ -46,30 +57,50 @@ Ported from the original [CryImporter for 3ds Max 8](https://www.takaro.net) by 
 | Import Skeleton | Build armature from bone chunks |
 | Import Vertex Weights | Assign bone weights for skinned meshes |
 
-### Animation
+---
 
-**Important:** Import the CGF geometry file first, then import animation with the armature selected.
+### Importing a single animation — CAF
 
-**File → Import → CryEngine Animation (.caf)** — single animation file
+**File → Import → CryEngine Animation (.caf)**
 
-**File → Import → CryEngine Animation List (.cal)** — imports all animations listed in the CAL file as separate Actions
+The addon **automatically finds and imports the CGF** from the same folder before loading the animation. You do not need to import the CGF manually first.
 
-### Workflow example
-
+**Required file layout:**
 ```
-1. File → Import → CryEngine Geometry (.cgf)     ← imports mesh + skeleton
-2. Select the armature in the viewport
-3. File → Import → CryEngine Animation (.caf)     ← imports animation onto armature
-   or
-   File → Import → CryEngine Animation List (.cal) ← imports all animations at once
+any_folder/
+├── model.cgf       ← found and imported automatically
+└── model.caf       ← select this
 ```
 
-### Tips
+If there are multiple CGF files in the folder, the addon first tries the one with the same base name as the CAF (`model.caf` → `model.cgf`), then falls back to any CGF found in the folder.
 
-- Place textures in the same folder as the `.cgf` file for auto-detection
-- Far Cry textures are `.dds` — Blender can load them natively
-- After CAF import, switch to the **Action Editor** to see and switch between imported animations
-- Scale is applied to geometry and animation data automatically — object scale stays `(1, 1, 1)`
+If you already have the CGF imported and the armature is in the scene — just select it and import the CAF directly, the auto-import step is skipped.
+
+---
+
+### Importing multiple animations — CAL
+
+**File → Import → CryEngine Animation List (.cal)**
+
+A CAL file is a plain text list of animation names and their CAF file paths. The addon reads it, **automatically imports the CGF** from the same folder, then imports all listed CAF files as separate Actions.
+
+**Required file layout:**
+```
+any_folder/
+├── model.cgf       ← found and imported automatically
+├── model.cal       ← select this
+├── idle.caf        ← imported automatically from the list
+├── walk.caf
+└── run.caf
+```
+
+After import, switch to the **Action Editor** (or **NLA Editor**) to see and switch between all imported animations.
+
+---
+
+### Switching between animations after import
+
+Open the **Action Editor** (bottom of the viewport → change editor type to Action Editor). All imported animations appear in the dropdown next to the action name field.
 
 ---
 
@@ -104,17 +135,16 @@ Ported from the original [CryImporter for 3ds Max 8](https://www.takaro.net) by 
 CryEngine 1 / Far Cry was authored in **3ds Max with inches** as the unit system.
 
 - **Scale:** `1 Max inch = 0.0254 Blender meters` — applied automatically to all geometry and animation data
-- **Axes:** Max Z-up → Blender Z-up (compatible, no rotation needed — node transforms handle orientation)
+- **Axes:** Max Z-up → Blender Z-up (compatible, node transforms handle orientation)
 - **Object scale:** always `(1, 1, 1)` — scale is baked into coordinates, not the object transform
 
 ---
 
 ## Known Limitations
 
-- BSpline controller types not supported (rare in Far Cry assets, complex to implement)
+- BSpline controller types not supported (rare in Far Cry assets)
 - VertAnim (vertex animation) chunks not yet applied
 - Physics-only meshes are skipped
-- Some very early CGF format versions may not parse correctly
 
 ---
 
@@ -122,8 +152,6 @@ CryEngine 1 / Far Cry was authored in **3ds Max with inches** as the unit system
 
 The CGF format is a chunk-based binary format developed by Crytek.
 File versions supported: `0x0744`, `0x0745`, `0x0746`, `0x0826`, `0x0827`
-
-Format reference based on reverse engineering by the modding community and the original CryImporter source by Takaro Pty. Ltd.
 
 ---
 
