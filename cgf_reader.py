@@ -526,26 +526,106 @@ class ChunkReader:
         return chunk
 
     def _read_material_chunk(self, header, next_chunk_pos):
-        self._seek(header.file_offset); self._skip(SIZE_CHUNK_HEADER)
-        chunk=CryMaterialChunk(); chunk.header=header
-        chunk.name=self._read_fixed_string(64)
-        chunk.shader_name=self._read_fixed_string(64)
-        chunk.surface_name=self._read_fixed_string(64)
-        chunk.flags=self._read_u32(); chunk.type=self._read_u32()
-        if header.version>=0x0746: chunk.alpha_test=self._read_f32()
-        for _ in range(self._read_u32()): chunk.children.append(self._read_u32())
-        chunk.ambient=self._read_color_rgb_float()
-        chunk.diffuse=self._read_color_rgb_float()
-        chunk.specular=self._read_color_rgb_float()
-        chunk.specular_level=self._read_f32(); chunk.specular_shininess=self._read_f32()
-        chunk.self_illumination=self._read_f32(); chunk.opacity=self._read_f32()
-        # 10 textures: ambient, diffuse, specular, opacity, bump, gloss, filter, reflection, subsurface, detail
-        textures=[self._read_texture(header.version) for _ in range(10)]
-        if textures[1] and textures[1].name: chunk.tex_diffuse=textures[1]
-        if textures[2] and textures[2].name: chunk.tex_specular=textures[2]
-        if textures[4] and textures[4].name: chunk.tex_bump=textures[4]
-        if textures[7] and textures[7].name: chunk.tex_reflection=textures[7]
-        if textures[9] and textures[9].name: chunk.tex_detail=textures[9]
+        """
+        Ported 1:1 from CryImporter-chunkreader.ms readMaterialChunk.
+
+        v745: name=64 bytes, no alphaTest, colors as RGB bytes
+        v746: name=124 bytes + 4 bytes alphaTest before type, colors as RGB bytes
+
+        Size constants from header.ms:
+          size_MTL_CHUNK_DESC_0746 = 2552
+          size_MTL_CHUNK_DESC_0745 = 1208
+        """
+        self._seek(header.file_offset)
+        self._skip(SIZE_CHUNK_HEADER)
+
+        chunk = CryMaterialChunk()
+        chunk.header = header
+
+        p = self._tell()
+
+        # Read name string (null-terminated) then skip to end of allocated space
+        raw_name = self._read_c_string()
+
+        if header.version == 0x0745:
+            self._seek(p + 64)          # 64-byte name field
+        else:
+            # v746: 124-byte name field + 4-byte reserved = 128 bytes total, then alphaTest float
+            self._seek(p + 124)
+            chunk.alpha_test = self._read_f32()
+
+        # Parse shader name and surface name out of the raw name string
+        # Format can be: "matname(shaderName)/surfaceName"
+        s_start = raw_name.find('(')
+        s_end   = raw_name.find(')')
+        m_start = raw_name.find('/')
+
+        if s_start != -1 and s_end != -1:
+            chunk.shader_name = raw_name[s_start+1:s_end]
+        if m_start != -1:
+            chunk.surface_name = raw_name[m_start+1:]
+
+        if m_start != -1 and s_start == -1:
+            chunk.name = raw_name[:m_start]
+        elif s_start != -1:
+            chunk.name = raw_name[:s_start]
+        else:
+            chunk.name = raw_name
+
+        chunk.name = chunk.name.strip()
+        if not chunk.name:
+            chunk.name = raw_name.strip()
+
+        # Material type
+        chunk.type = self._read_i32()
+
+        if chunk.type == 2:  # materialType_Multi
+            num_children = self._read_i32()
+
+            # Skip to end of material chunk descriptor, then read child IDs
+            if header.version == 0x0746:
+                self._seek(header.file_offset + 2552)
+            else:
+                self._seek(header.file_offset + 1208)
+
+            for _ in range(num_children):
+                child_id = self._read_i32()
+                if child_id > 0:
+                    chunk.children.append(child_id)
+
+        else:  # materialType_Standard (1) or other
+            # Colors stored as RGB bytes (not floats!)
+            # Order: diffuse, specular, ambient + 3 padding bytes
+            def read_color_byte():
+                r = self._read_u8() / 255.0
+                g = self._read_u8() / 255.0
+                b = self._read_u8() / 255.0
+                return (r, g, b)
+
+            chunk.diffuse  = read_color_byte()
+            chunk.specular = read_color_byte()
+            chunk.ambient  = read_color_byte()
+            self._skip(3)  # padding to 4-byte boundary
+
+            chunk.specular_level     = self._read_f32()
+            chunk.specular_shininess = self._read_f32()
+            chunk.self_illumination  = self._read_f32()
+            chunk.opacity            = self._read_f32()
+
+            # 10 textures in order: ambient, diffuse, specular, opacity,
+            #                       bump, gloss, filter(detail), reflection, subsurface, detail(normalmap)
+            textures = [self._read_texture(header.version) for _ in range(10)]
+            if textures[1] and textures[1].name: chunk.tex_diffuse    = textures[1]
+            if textures[2] and textures[2].name: chunk.tex_specular   = textures[2]
+            if textures[4] and textures[4].name: chunk.tex_bump       = textures[4]
+            if textures[7] and textures[7].name: chunk.tex_reflection = textures[7]
+            if textures[9] and textures[9].name: chunk.tex_detail     = textures[9]
+
+            # Flags come AFTER textures
+            chunk.flags = self._read_u32()
+            # dynamicBounce, staticFriction, slidingFriction (not used in Blender)
+            self._skip(12)
+
         return chunk
 
     def _read_controller_chunk(self, header, next_chunk_pos):
@@ -600,11 +680,13 @@ class ChunkReader:
         return chunk
 
     def _read_mesh_morph_target_chunk(self, header, next_chunk_pos):
+        # Original Max script order: meshChunkID → numVerts → targetVertices → name (ReadString at end)
         self._seek(header.file_offset); self._skip(SIZE_CHUNK_HEADER)
         chunk=CryMeshMorphTargetChunk(); chunk.header=header
-        chunk.mesh_chunk_id=self._read_u32(); chunk.name=self._read_fixed_string(64)
+        chunk.mesh_chunk_id=self._read_u32()
         for _ in range(self._read_u32()):
             chunk.target_vertices.append(CryMeshMorphTargetVertex(self._read_u32(), self._read_point3()))
+        chunk.name=self._read_c_string()  # name is at the END, variable length
         return chunk
 
     def _read_bone_initial_pos_chunk(self, header, next_chunk_pos):
