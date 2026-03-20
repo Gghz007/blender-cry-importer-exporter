@@ -80,6 +80,16 @@ def quat_exp(rot_log):
 
 # ── Material ──────────────────────────────────────────────────────────────────
 
+def _build_cgf_mat_name(name, shader_name, surface_name):
+    """Reconstruct full CGF material name: 'name(shader)/surface'"""
+    result = name
+    if shader_name:
+        result += f"({shader_name})"
+    if surface_name:
+        result += f"/{surface_name}"
+    return result
+
+
 def _set_input(node, *names, value):
     for name in names:
         if name in node.inputs:
@@ -96,6 +106,12 @@ def build_material(mat_chunk, filepath, import_materials, game_root_path=""):
         return mat
 
     mat = bpy.data.materials.new(name=mat_chunk.name)
+    # Store original CGF material info for round-trip export
+    mat['cgf_shader_name']  = mat_chunk.shader_name
+    mat['cgf_surface_name'] = mat_chunk.surface_name
+    mat['cgf_full_name']    = _build_cgf_mat_name(mat_chunk.name,
+                                                    mat_chunk.shader_name,
+                                                    mat_chunk.surface_name)
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
