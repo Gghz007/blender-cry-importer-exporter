@@ -379,9 +379,14 @@ class ChunkReader:
         return raw[:end].decode('latin-1')
 
     def _read_c_string(self):
-        start=self.pos
-        while self.pos<len(self.data) and self.data[self.pos]!=0: self.pos+=1
-        s=self.data[start:self.pos].decode('latin-1'); self.pos+=1; return s
+        start = self.pos
+        end = len(self.data)
+        while self.pos < end and self.data[self.pos] != 0:
+            self.pos += 1
+        s = self.data[start:self.pos].decode('latin-1')
+        if self.pos < end:
+            self.pos += 1  # skip null terminator
+        return s
 
     def _read_matrix44(self): return [self._read_f32() for _ in range(16)]
     def _read_matrix43(self): return [self._read_f32() for _ in range(12)]
@@ -502,9 +507,24 @@ class ChunkReader:
         return chunk
 
     def _read_bone_name_list_chunk(self, header, next_chunk_pos):
-        self._seek(header.file_offset); self._skip(SIZE_CHUNK_HEADER)
-        chunk=CryBoneNameListChunk(); chunk.header=header
-        for _ in range(self._read_u32()): chunk.name_list.append(self._read_fixed_string(32))
+        self._seek(header.file_offset)
+        chunk = CryBoneNameListChunk()
+        chunk.header = header
+
+        if header.version == 0x0745:
+            # v745: NO chunk header skip, names are null-terminated C strings
+            num = self._read_u32()
+            for _ in range(num):
+                chunk.name_list.append(self._read_c_string())
+        else:
+            # Other versions: skip chunk header, names are fixed 64-byte buffers
+            self._skip(SIZE_CHUNK_HEADER)
+            num = self._read_u32()
+            for _ in range(num):
+                p = self._tell()
+                chunk.name_list.append(self._read_c_string())
+                self._seek(p + 64)  # skip to end of 64-byte buffer
+
         return chunk
 
     def _read_node_chunk(self, header, next_chunk_pos):
@@ -740,6 +760,7 @@ class ChunkReader:
         archive.geom_file_name=filepath if is_geom else ""
         for i,h in enumerate(headers):
             next_pos=hpos[i+1] if i+1<num_chunks else chunk_table_pos
+            print(f"[CGF] chunk {i}/{num_chunks} type=0x{h.type:04X} ver=0x{h.version:04X} offset={h.file_offset}")
             chunk=self._read_chunk(h, next_pos)
             if chunk is not None: archive.add(chunk)
         return archive
