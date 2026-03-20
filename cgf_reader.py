@@ -430,18 +430,28 @@ class ChunkReader:
         return (self._read_fixed_string(32), self._read_i32(), self._read_i32())
 
     def _read_texture(self, chunk_version):
-        tex=CryTexture()
-        p=self._tell()
-        name_len=128 if chunk_version>=0x0746 else 32
-        tex.name=self._read_fixed_string(name_len)
-        self._seek(p+name_len)
-        tex.type=self._read_u32(); tex.flags=self._read_u32(); tex.amount=self._read_i32()
-        tex.u_tile=bool(self._read_u8()); tex.u_mirror=bool(self._read_u8())
-        tex.v_tile=bool(self._read_u8()); tex.v_mirror=bool(self._read_u8())
+        tex = CryTexture()
+        p = self._tell()
+        # v746: name field = 152 bytes; v745: 32 bytes
+        name_len = 152 if chunk_version >= 0x0746 else 32
+        tex.name   = self._read_fixed_string(name_len)
+        self._seek(p + name_len)
+        tex.type   = self._read_u32()
+        tex.flags  = self._read_u32()
+        tex.amount = self._read_i32()
+        tex.u_tile   = bool(self._read_u8())
+        tex.u_mirror = bool(self._read_u8())
+        tex.v_tile   = bool(self._read_u8())
+        tex.v_mirror = bool(self._read_u8())
         self._skip(12)  # nth_frame(4) + ref_size(4) + ref_blur(4)
-        tex.u_offset=self._read_f32(); tex.u_scale=self._read_f32(); self._skip(4)
-        tex.v_offset=self._read_f32(); tex.v_scale=self._read_f32(); self._skip(4); self._skip(4)
-        self._skip(7*4)  # 7 controller IDs
+        tex.u_offset = self._read_f32()
+        tex.u_scale  = self._read_f32()
+        self._skip(4)   # u_rotation
+        tex.v_offset = self._read_f32()
+        tex.v_scale  = self._read_f32()
+        self._skip(4)   # v_rotation
+        self._skip(4)   # w_rotation
+        self._skip(7*4) # 7 controller IDs
         return tex
 
     # ── Animation key readers ─────────────────────────────────────────────────
