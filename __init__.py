@@ -34,9 +34,9 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
     import_uvs: BoolProperty(name="Import UVs",
         description="Import texture coordinates", default=True)
     import_skeleton: BoolProperty(name="Import Skeleton",
-        description="Build armature from bone chunks", default=True)
+        description="Build armature from bone chunks", default=False)
     import_weights: BoolProperty(name="Import Vertex Weights",
-        description="Assign bone weights for skinned meshes", default=True)
+        description="Assign bone weights for skinned meshes", default=False)
     game_root_path: StringProperty(name="Game Root Path",
         description="Root folder of Far Cry installation (where Objects/, Textures/ etc. are located). "
                     "Used to find textures by their relative path stored in materials.",
