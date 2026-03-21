@@ -100,29 +100,32 @@ def build_bone_name_list_chunk(chunk_id, names):
 
 def build_bone_anim_chunk(chunk_id, bones):
     """
-    0x0003 BoneAnim chunk.
-    bones: list of dicts with keys:
-      bone_id, parent_id, num_children, ctrl_id,
-      custom_property, bone_physics (dict or None)
+    0x0003 BoneAnim chunk v0290.
+    Bone struct = 152 bytes:
+      bone_id(4) + parent_id(4) + num_children(4) + ctrl_id(8) + custom_prop(32) + physics(100)
+    ctrl_id is stored as uint32 + 4 zero padding bytes = 8 bytes total.
     """
     data = pack_u32(len(bones))
     for b in bones:
         data += pack_i32(b['bone_id'])
         data += pack_i32(b['parent_id'])
         data += pack_i32(b['num_children'])
-        data += pack_u32(b['ctrl_id'])
+        data += pack_u32(b['ctrl_id']) + b'\x00\x00\x00\x00'  # ctrl_id = 8 bytes (uint32 + 4 padding)
         data += pack_fixed_string(b.get('custom_property', ''), 32)
-        # BonePhysics (all zeros if no physics)
         data += _pack_bone_physics(b.get('bone_physics'))
     return data, 0x0290, chunk_id
 
 
 def _pack_bone_physics(phys):
-    """Pack CryBonePhysics struct (zeros if None)."""
+    """
+    Pack CryBonePhysics struct = 100 bytes:
+      mesh_id(4) + minimum(12) + maximum(12) + spring_angle(12)
+      + spring_tension(12) + damping(12) + frame_3x3_matrix(36)
+    Note: no flags field — confirmed from hex analysis of original files.
+    """
     if phys is None:
-        return b'\x00' * (4 + 4 + 12*7 + 12*3)  # mesh_id + flags + 7 point3 + 3x3 matrix
+        return b'\x00\x00\x00\xff' + b'\x00' * 96  # mesh_id=-1 (0xFFFFFFFF) + 96 zeros
     return (pack_i32(phys.get('mesh_id', -1)) +
-            pack_u32(phys.get('flags', 0)) +
             pack_point3(phys.get('minimum', (0,0,0))) +
             pack_point3(phys.get('maximum', (0,0,0))) +
             pack_point3(phys.get('spring_angle', (0,0,0))) +
@@ -146,14 +149,20 @@ def build_bone_initial_pos_chunk(chunk_id, mesh_chunk_id, matrices):
 
 
 def build_mesh_chunk(chunk_id, vertices, faces, tex_vertices, tex_faces,
-                      physique=None, has_bone_info=False):
+                      physique=None, has_bone_info=False,
+                      bone_matrices=None, bone_initial_pos_id=None):
     """
     0x0000 Mesh chunk (v0744).
     vertices: list of (pos, normal) where pos/normal are (x,y,z)
     faces: list of (v0, v1, v2, mat_id, smooth_group)
     tex_vertices: list of (u, v)
     tex_faces: list of (t0, t1, t2)
-    physique: list of CryBoneLinks or None
+    physique: list of bone links per vertex
+    bone_matrices: list of 12-float matrices for BoneInitialPos (embedded at end)
+    bone_initial_pos_id: chunk_id for BoneInitialPos (for chunk table entry)
+
+    BoneInitialPos is embedded at the END of mesh chunk data (not a separate chunk).
+    The chunk table has a separate entry pointing to this embedded data.
     """
     num_verts  = len(vertices)
     num_tverts = len(tex_vertices)
@@ -196,11 +205,20 @@ def build_mesh_chunk(chunk_id, vertices, faces, tex_vertices, tex_faces,
                 data += pack_f32(blending)
 
     # Vertex colors — write white (255,255,255) for all verts
-    # Engine reads these even if not used visually
     for _ in range(num_verts):
         data += b'\xFF\xFF\xFF'
 
-    return data, 0x0744, chunk_id
+    # BoneInitialPos embedded at end of mesh chunk (original format)
+    # mesh_chunk_id(4) + num_matrices(4) + matrices(n×48)
+    bone_initial_pos_offset = None
+    if has_bone_info and bone_matrices:
+        bone_initial_pos_offset = len(data)  # offset within mesh data
+        data += pack_u32(chunk_id)           # mesh_chunk_id = this chunk's id
+        data += pack_u32(len(bone_matrices))
+        for m in bone_matrices:
+            data += pack_matrix43(m)
+
+    return data, 0x0744, chunk_id, bone_initial_pos_offset
 
 
 def build_node_chunk(chunk_id, name, object_id, parent_id, material_id,
@@ -250,7 +268,7 @@ def build_material_chunk(chunk_id, name, mat_type=1, children=None,
                           diffuse=(0.8,0.8,0.8), specular=(0,0,0), ambient=(0,0,0),
                           specular_level=0.0, specular_shininess=0.0,
                           self_illumination=0.0, opacity=1.0,
-                          tex_diffuse="", tex_bump="",
+                          tex_diffuse="", tex_bump="", tex_detail="",
                           flags=0, alpha_test=0.0):
     """
     0x000C Material chunk (v0746).
@@ -263,10 +281,11 @@ def build_material_chunk(chunk_id, name, mat_type=1, children=None,
 
     if mat_type == 2:  # Multi
         data += pack_i32(len(children or []))
-        # Pad to size_MTL_CHUNK_DESC_0746 = 2552 from chunk start (after header)
-        # After type(4) + numChildren(4) we need to pad to offset 2552
-        current = 124 + 4 + 4 + 4  # name + alphaTest + type + numChildren
-        pad = 2552 - current
+        # Children IDs must be at offset (chunk_file_offset + 2552) from file
+        # = 16 (embedded header) + 2536 bytes of data before children
+        # current data written so far: name(124) + alphaTest(4) + type(4) + numChildren(4) = 136
+        current = 124 + 4 + 4 + 4
+        pad = 2536 - current  # pad to 2536 bytes total data before children
         data += b'\x00' * pad
         for cid in (children or []):
             data += pack_i32(cid)
@@ -283,15 +302,15 @@ def build_material_chunk(chunk_id, name, mat_type=1, children=None,
         # 10 texture slots (each 236 bytes with 152-byte name)
         for tex_name in [
             "",          # 0 ambient
-            tex_diffuse, # 1 diffuse
+            tex_diffuse, # 1 diffuse ← main texture
             "",          # 2 specular
             "",          # 3 opacity
-            tex_bump,    # 4 bump
+            tex_bump,    # 4 bump ← DDN normal map (_ddn)
             "",          # 5 gloss
-            "",          # 6 filter/detail
+            "",          # 6 filter
             "",          # 7 reflection
             "",          # 8 subsurface
-            "",          # 9 detail/normalmap
+            tex_detail,  # 9 detail ← heightmap/bump (_bump)
         ]:
             data += _pack_texture(tex_name)
         # Flags + physics params
@@ -360,14 +379,21 @@ class CGFWriter:
     def __init__(self, is_anim=False):
         self.is_anim = is_anim
         self.chunks = []  # list of (type, version, chunk_id, data_bytes)
+        self.extra_table_entries = []  # list of (type, version, absolute_offset, chunk_id)
+                                       # for embedded chunks like BoneInitialPos
 
     def add_chunk(self, chunk_type, version, chunk_id, data):
         self.chunks.append((chunk_type, version, chunk_id, data))
 
+    def add_embedded_chunk_entry(self, chunk_type, version, chunk_id, parent_chunk_idx, data_offset):
+        """
+        Register an embedded chunk that lives inside another chunk's data.
+        parent_chunk_idx: index in self.chunks of the parent chunk
+        data_offset: byte offset within parent chunk's data (after the 16-byte header)
+        """
+        self.extra_table_entries.append((chunk_type, version, chunk_id, parent_chunk_idx, data_offset))
+
     def write(self, filepath):
-        # Calculate offsets
-        # File header = 20 bytes
-        # Each chunk = SIZE_CHUNK_HEADER (16) + len(data)
         FILE_HEADER_SIZE = 20
 
         offsets = []
@@ -378,22 +404,14 @@ class CGFWriter:
 
         chunk_table_offset = pos
 
-        # Build output
         out = bytearray()
 
-        # File header (20 bytes):
-        # 6 bytes signature
-        # 2 bytes padding
-        # 2 bytes file type low
-        # 2 bytes file type high
-        # 4 bytes version
-        # 4 bytes chunk table offset
         out += FILE_SIGNATURE
-        out += b'\x00\x00'  # padding
+        out += b'\x00\x00'
         if self.is_anim:
             out += pack_u16(FILE_TYPE_ANIM_LOW)
             out += pack_u16(FILE_TYPE_ANIM_HIGH)
-            out += pack_u32(0x0744)  # file version
+            out += pack_u32(0x0744)
         else:
             out += pack_u16(FILE_TYPE_GEOM_LOW)
             out += pack_u16(FILE_TYPE_GEOM_HIGH)
@@ -405,10 +423,21 @@ class CGFWriter:
             out += pack_chunk_header(chunk_type, version, offsets[i], chunk_id)
             out += data
 
-        # Chunk table
-        out += pack_u32(len(self.chunks))
+        # Chunk table — all normal chunks + embedded chunks
+        total_entries = len(self.chunks) + len(self.extra_table_entries)
+        out += pack_u32(total_entries)
+
         for i, (chunk_type, version, chunk_id, data) in enumerate(self.chunks):
             out += pack_chunk_header(chunk_type, version, offsets[i], chunk_id)
+
+        # Extra embedded chunk entries
+        for chunk_type, version, chunk_id, parent_idx, data_offset in self.extra_table_entries:
+            # Absolute offset = parent chunk offset + 16 (header) + data_offset
+            abs_offset = offsets[parent_idx] + SIZE_CHUNK_HEADER + data_offset
+            out += pack_chunk_header(chunk_type, version, abs_offset, chunk_id)
+
+        with open(filepath, 'wb') as f:
+            f.write(out)
 
         with open(filepath, 'wb') as f:
             f.write(out)
