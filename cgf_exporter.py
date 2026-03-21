@@ -305,15 +305,32 @@ def extract_armature_data(arm_obj):
 
 def extract_bone_matrices(arm_obj, bone_data_list):
     """
-    Extract 4x3 rest pose matrices for each bone (BoneInitialPos).
-    Uses bone.matrix_local (local to armature).
+    Extract 4x3 rest pose world-space matrices for BoneInitialPos.
+    Uses original CGF matrices stored on armature if available (round-trip).
+    Falls back to computing from current bone world-space transform.
     """
+    import json
+
+    # Try to load stored original matrices
+    stored_json = arm_obj.get('cgf_bone_matrices')
+    stored = {}
+    if stored_json:
+        try:
+            stored = json.loads(stored_json)
+        except Exception:
+            pass
+
     matrices = []
     for bd in bone_data_list:
-        bone = arm_obj.data.bones[bd['name']]
-        # matrix_local is relative to armature — this is the world space in Cry
-        m = blender_matrix_to_cry43(bone.matrix_local)
-        matrices.append(m)
+        bname = bd['name']
+        if bname in stored:
+            matrices.append(stored[bname])
+        else:
+            # Compute world-space matrix from current bone state
+            bone = arm_obj.data.bones[bname]
+            world_mat = arm_obj.matrix_world @ bone.matrix_local
+            m = blender_matrix_to_cry43(world_mat)
+            matrices.append(m)
     return matrices
 
 
@@ -337,7 +354,8 @@ def extract_materials(obj):
         specular = (0, 0, 0)
         opacity  = 1.0
         tex_diff = ''
-        tex_bump = ''
+        tex_bump   = ''  # slot 4 — DDN normal map (_ddn)
+        tex_detail = ''  # slot 9 — heightmap (_bump)
 
         if mat.use_nodes:
             for node in mat.node_tree.nodes:
@@ -350,31 +368,77 @@ def extract_materials(obj):
                     al = node.inputs.get('Alpha')
                     if al:
                         opacity = al.default_value
-                    # Find connected image texture
+                    # Diffuse texture
                     if bc and bc.links:
                         tex_node = bc.links[0].from_node
                         if tex_node.type == 'TEX_IMAGE' and tex_node.image:
                             tex_diff = tex_node.image.filepath_raw or tex_node.image.name
+                    # Normal/bump textures via Normal input
+                    normal_input = node.inputs.get('Normal')
+                    if normal_input and normal_input.links:
+                        norm_node = normal_input.links[0].from_node
+                        if norm_node.type == 'NORMAL_MAP':
+                            # Normal Map node → DDN → slot 4 (bump)
+                            color_in = norm_node.inputs.get('Color')
+                            if color_in and color_in.links:
+                                t = color_in.links[0].from_node
+                                if t.type == 'TEX_IMAGE' and t.image:
+                                    tex_bump = t.image.filepath_raw or t.image.name
+                        elif norm_node.type == 'BUMP':
+                            # Bump node → heightmap → slot 9 (detail)
+                            height_in = norm_node.inputs.get('Height')
+                            if height_in and height_in.links:
+                                t = height_in.links[0].from_node
+                                if t.type == 'TEX_IMAGE' and t.image:
+                                    tex_detail = t.image.filepath_raw or t.image.name
 
         result.append({
-            # Use original CGF full name (with shader/surface) if stored
             'name':        mat.get('cgf_full_name', mat.name),
             'diffuse':     diffuse,
             'specular':    specular,
             'opacity':     opacity,
             'tex_diffuse': tex_diff,
             'tex_bump':    tex_bump,
+            'tex_detail':  tex_detail,
         })
+        print(f"[CGF Export] Material '{mat.name}': diffuse='{tex_diff}' bump(ddn)='{tex_bump}' detail(bump)='{tex_detail}'")
 
     return result
 
 
 # ── CGF export ────────────────────────────────────────────────────────────────
 
+def _to_game_relative(path, game_root_path):
+    """
+    Convert absolute texture path to game-relative path with backslashes.
+    Always writes .dds extension — CryEngine 1 expects .dds in CGF files.
+    """
+    if not path:
+        return ''
+    path = os.path.normpath(path)
+    if game_root_path:
+        root = os.path.normpath(game_root_path)
+        if path.lower().startswith(root.lower()):
+            path = path[len(root):]
+            if path.startswith(os.sep):
+                path = path[1:]
+    # Force .dds extension regardless of actual file format
+    base = os.path.splitext(path)[0]
+    path = base + '.dds'
+    # Convert to backslashes (CryEngine convention)
+    return path.replace('/', '\\')
+
+
 def export_cgf(operator, context, filepath,
                export_materials=True, export_skeleton=True,
                export_weights=True, selected_only=False):
     """Export selected/active mesh(es) to CGF."""
+
+    # Get game root path from addon preferences
+    game_root_path = ""
+    prefs = context.preferences.addons.get('io_import_cgf')
+    if prefs:
+        game_root_path = prefs.preferences.game_root_path
 
     if selected_only:
         objects = [o for o in context.selected_objects
@@ -410,48 +474,22 @@ def export_cgf(operator, context, filepath,
         chunk_id += 1
         return chunk_id
 
-    # Source info
-    import getpass, datetime
-    data, ver, cid = build_source_info_chunk(
-        next_id(),
-        source_file=filepath,
-        date=datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"),
-        user=getpass.getuser()
-    )
-    writer.add_chunk(CT_SRCINFO, ver, cid, data)
+    # ── Pre-extract all data ──────────────────────────────────────────────────
 
-    # Timing
-    scene = context.scene
-    fps = scene.render.fps
-    ticks_per_frame = 160
-    secs_per_tick = 1.0 / (fps * ticks_per_frame)
-    data, ver, cid = build_timing_chunk(
-        next_id(), ticks_per_frame, secs_per_tick,
-        scene.frame_start, scene.frame_end
-    )
-    writer.add_chunk(CT_TIMING, ver, cid, data)
-
-    # Armature (bones)
+    # Armature
     bone_data_list = []
     bone_idx = {}
     bone_name_list = []
-
     if arm_obj and export_skeleton:
         print(f"[CGF Export] Extracting armature: {arm_obj.name}")
         bone_data_list, bone_idx = extract_armature_data(arm_obj)
         bone_name_list = [b['name'] for b in bone_data_list]
 
-        # BoneAnim chunk
-        data, ver, cid = build_bone_anim_chunk(next_id(), bone_data_list)
-        writer.add_chunk(CT_BANIM, ver, cid, data)
-
-        # BoneNameList chunk
-        data, ver, cid = build_bone_name_list_chunk(next_id(), bone_name_list)
-        writer.add_chunk(CT_BNAMES, ver, cid, data)
-
-    # Materials
-    mat_chunk_ids = {}  # mat_name → chunk_id
+    # Assign chunk IDs upfront so Node can reference Mesh and Material
+    # Original order: SourceInfo, Timing, Node, MultiMat, Mesh, StandardMats, BoneAnim, BoneNames
+    mat_chunk_ids   = {}   # mat_name → chunk_id
     all_standard_mats = []
+    multi_mat_ids   = {}   # obj.name → chunk_id
 
     if export_materials:
         for obj in objects:
@@ -462,68 +500,58 @@ def export_cgf(operator, context, filepath,
                     mat_chunk_ids[mat['name']] = cid
                     all_standard_mats.append((cid, mat))
 
-        for cid, mat in all_standard_mats:
-            data, ver, _ = build_material_chunk(
-                cid, mat['name'],
-                mat_type=1,
-                diffuse=mat['diffuse'],
-                specular=mat['specular'],
-                opacity=mat['opacity'],
-                tex_diffuse=mat.get('tex_diffuse', ''),
-                tex_bump=mat.get('tex_bump', ''),
-            )
-            writer.add_chunk(CT_MAT, ver, cid, data)
+    # Pre-assign mesh and node IDs
+    obj_mesh_ids = {}   # obj → mesh_cid
+    obj_node_ids = {}   # obj → node_cid
+    obj_multi_ids = {}  # obj → multi_mat_cid
+    obj_bipos_ids = {}  # obj → bipos_cid
 
-    # Build multi-material if multiple mats per object
-    multi_mat_ids = {}  # obj.name → multi_mat_chunk_id
     for obj in objects:
-        if len(obj.material_slots) > 1:
+        obj_mesh_ids[obj.name] = next_id()
+        obj_node_ids[obj.name] = next_id()
+        # Multi-material — use same key as mat_chunk_ids (cgf_full_name or mat.name)
+        if export_materials and len(obj.material_slots) > 1:
             children = []
-            for slot in obj.material_slots:
-                if slot.material and slot.material.name in mat_chunk_ids:
-                    children.append(mat_chunk_ids[slot.material.name])
+            for s in obj.material_slots:
+                if s.material:
+                    key = s.material.get('cgf_full_name', s.material.name)
+                    if key in mat_chunk_ids:
+                        children.append(mat_chunk_ids[key])
             if children:
-                cid = next_id()
-                multi_mat_ids[obj.name] = cid
-                data, ver, _ = build_material_chunk(
-                    cid, obj.name + "_multi",
-                    mat_type=2, children=children
-                )
-                writer.add_chunk(CT_MAT, ver, cid, data)
+                obj_multi_ids[obj.name] = next_id()
 
-    # Meshes + Nodes
-    mesh_chunk_ids = {}  # obj.name → mesh_chunk_id
+    # ── Write chunks in correct order ─────────────────────────────────────────
 
+    # 1. SourceInfo
+    import getpass, datetime
+    data, ver, cid = build_source_info_chunk(
+        next_id(),
+        source_file=filepath,
+        date=datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"),
+        user=getpass.getuser()
+    )
+    writer.add_chunk(CT_SRCINFO, ver, cid, data)
+
+    # 2. Timing
+    scene = context.scene
+    fps = scene.render.fps
+    ticks_per_frame = 160
+    secs_per_tick = 1.0 / (fps * ticks_per_frame)
+    data, ver, cid = build_timing_chunk(
+        next_id(), ticks_per_frame, secs_per_tick,
+        scene.frame_start, scene.frame_end
+    )
+    writer.add_chunk(CT_TIMING, ver, cid, data)
+
+    # 3. Node chunks (before mesh — original order)
     for obj in objects:
-        print(f"[CGF Export] Extracting mesh: {obj.name}")
-        md = extract_mesh_data(obj, arm_obj if export_weights else None)
+        mesh_cid = obj_mesh_ids[obj.name]
+        node_cid = obj_node_ids[obj.name]
+        ctrl_id  = ctrl_id_from_name(obj.name)
 
-        mesh_cid = next_id()
-        mesh_chunk_ids[obj.name] = mesh_cid
-
-        data, ver, _ = build_mesh_chunk(
-            mesh_cid,
-            vertices   = md['vertices'],
-            faces      = md['faces'],
-            tex_vertices = md['tex_verts'],
-            tex_faces  = md['tex_faces'],
-            physique   = md['physique'],
-            has_bone_info = md['has_bone_info'],
-        )
-        writer.add_chunk(CT_MESH, ver, mesh_cid, data)
-
-        # BoneInitialPos — once, for first skinned mesh
-        if md['has_bone_info'] and arm_obj and bone_data_list:
-            matrices = extract_bone_matrices(arm_obj, bone_data_list)
-            data, ver, cid = build_bone_initial_pos_chunk(
-                next_id(), mesh_cid, matrices
-            )
-            writer.add_chunk(CT_BIPOS, ver, cid, data)
-
-        # Node chunk
         if export_materials:
-            if obj.name in multi_mat_ids:
-                mat_id = multi_mat_ids[obj.name]
+            if obj.name in obj_multi_ids:
+                mat_id = obj_multi_ids[obj.name]
             elif obj.material_slots and obj.material_slots[0].material:
                 mat_id = mat_chunk_ids.get(obj.material_slots[0].material.name, -1)
             else:
@@ -531,35 +559,97 @@ def export_cgf(operator, context, filepath,
         else:
             mat_id = -1
 
-        # Node transform — use identity matrix.
-        # Vertex positions are already baked into world space in extract_mesh_data,
-        # so the node transform should be identity (like Max exports static meshes).
-        identity_m44 = [
-            1,0,0,0,
-            0,1,0,0,
-            0,0,1,0,
-            0,0,0,0,
-        ]
-        identity_pos = (0.0, 0.0, 0.0)
-        identity_rot = (0.0, 0.0, 0.0, 1.0)  # x,y,z,w
-        identity_scl = (1.0, 1.0, 1.0)
-
-        node_cid = next_id()
-        ctrl_id  = ctrl_id_from_name(obj.name)
         data, ver, _ = build_node_chunk(
             node_cid, obj.name,
-            object_id   = mesh_cid,
-            parent_id   = -1,
-            material_id = mat_id,
-            trans_matrix = identity_m44,
-            position = identity_pos,
-            rotation = identity_rot,
-            scale    = identity_scl,
+            object_id    = mesh_cid,
+            parent_id    = -1,
+            material_id  = mat_id,
+            trans_matrix = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,0],
+            position     = (0.0, 0.0, 0.0),
+            rotation     = (0.0, 0.0, 0.0, 1.0),
+            scale        = (1.0, 1.0, 1.0),
             pos_ctrl_id   = ctrl_id,
             rot_ctrl_id   = ctrl_id,
             scale_ctrl_id = ctrl_id,
         )
         writer.add_chunk(CT_NODE, ver, node_cid, data)
+
+    # 4. Multi-material chunks (before mesh — original order)
+    if export_materials:
+        for obj in objects:
+            if obj.name in obj_multi_ids:
+                children = []
+                for s in obj.material_slots:
+                    if s.material:
+                        key = s.material.get('cgf_full_name', s.material.name)
+                        if key in mat_chunk_ids:
+                            children.append(mat_chunk_ids[key])
+                cid = obj_multi_ids[obj.name]
+                # Multi-material name = base name of first material
+                first_mat = obj.material_slots[0].material if obj.material_slots else None
+                base_name = ''
+                if first_mat:
+                    full = first_mat.get('cgf_full_name', first_mat.name)
+                    base_name = full.split('(')[0].split('/')[0]
+                data, ver, _ = build_material_chunk(
+                    cid, base_name, mat_type=2, children=children
+                )
+                writer.add_chunk(CT_MAT, ver, cid, data)
+
+    # 5. Mesh chunks (with embedded BoneInitialPos)
+    for obj in objects:
+        print(f"[CGF Export] Extracting mesh: {obj.name}")
+        md = extract_mesh_data(obj, arm_obj if export_weights else None)
+
+        mesh_cid = obj_mesh_ids[obj.name]
+
+        bone_matrices = None
+        bipos_cid = None
+        if md['has_bone_info'] and arm_obj and bone_data_list:
+            bone_matrices = extract_bone_matrices(arm_obj, bone_data_list)
+            bipos_cid = next_id()
+
+        data, ver, _, bipos_offset = build_mesh_chunk(
+            mesh_cid,
+            vertices      = md['vertices'],
+            faces         = md['faces'],
+            tex_vertices  = md['tex_verts'],
+            tex_faces     = md['tex_faces'],
+            physique      = md['physique'],
+            has_bone_info = md['has_bone_info'],
+            bone_matrices = bone_matrices,
+        )
+        mesh_chunk_idx = len(writer.chunks)
+        writer.add_chunk(CT_MESH, ver, mesh_cid, data)
+
+        if bone_matrices and bipos_offset is not None:
+            writer.add_embedded_chunk_entry(
+                CT_BIPOS, 0x0001, bipos_cid,
+                mesh_chunk_idx, bipos_offset
+            )
+
+    # 6. Standard material chunks (after mesh — original order)
+    if export_materials:
+        for cid, mat in all_standard_mats:
+            data, ver, _ = build_material_chunk(
+                cid, mat['name'],
+                mat_type=1,
+                diffuse=mat['diffuse'],
+                specular=mat['specular'],
+                opacity=mat['opacity'],
+                tex_diffuse=_to_game_relative(mat.get('tex_diffuse', ''), game_root_path),
+                tex_bump=_to_game_relative(mat.get('tex_bump', ''), game_root_path),
+                tex_detail=_to_game_relative(mat.get('tex_detail', ''), game_root_path),
+            )
+            writer.add_chunk(CT_MAT, ver, cid, data)
+
+    # 7. BoneAnim + BoneNameList (after mesh — original order)
+    if arm_obj and export_skeleton and bone_data_list:
+        data, ver, cid = build_bone_anim_chunk(next_id(), bone_data_list)
+        writer.add_chunk(CT_BANIM, ver, cid, data)
+
+        data, ver, cid = build_bone_name_list_chunk(next_id(), bone_name_list)
+        writer.add_chunk(CT_BNAMES, ver, cid, data)
 
     writer.write(filepath)
     print(f"[CGF Export] Written: {filepath}")
