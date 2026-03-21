@@ -11,11 +11,133 @@ bl_info = {
 import bpy
 import os
 from bpy.props import StringProperty, BoolProperty, EnumProperty
-from bpy.types import AddonPreferences
+from bpy.types import AddonPreferences, Panel, PropertyGroup
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 from . import cgf_reader
 from . import cgf_builder
 from . import cgf_exporter
+
+
+# ── CryEngine Material Properties ─────────────────────────────────────────────
+
+# Common Far Cry shaders
+SHADER_ITEMS = [
+    ('custom',                       "Custom...",                    "Enter shader name manually"),
+    ('TemplModelCommon',             "TemplModelCommon",             "Standard model — no bump"),
+    ('TemplBumpDiffuse',             "TemplBumpDiffuse",             "Diffuse + bump/normal map"),
+    ('TemplBumpSpec',                "TemplBumpSpec",                "Diffuse + bump + specular"),
+    ('TemplBumpSpec_GlossAlpha',     "TemplBumpSpec_GlossAlpha",     "Diffuse + bump + spec + gloss in alpha"),
+    ('TemplBumpSpec_HP_GlossAlpha',  "TemplBumpSpec_HP_GlossAlpha",  "Hi-poly bump + spec + gloss in alpha"),
+    ('Phong',                        "Phong",                        "Simple Phong shading"),
+    ('NoDraw',                       "NoDraw",                       "Invisible — collision/physics only"),
+    ('Glass',                        "Glass",                        "Glass / transparent surface"),
+    ('Vegetation',                   "Vegetation",                   "Vegetation / foliage"),
+    ('Terrain',                      "Terrain",                      "Terrain layer blend"),
+    ('Metal',                        "Metal",                        "Metal surface shader"),
+]
+
+SURFACE_ITEMS = [
+    ('mat_default',      "mat_default",      "Default — general purpose"),
+    ('mat_metal',        "mat_metal",        "Metal — generic"),
+    ('mat_metal_plate',  "mat_metal_plate",  "Metal plate"),
+    ('mat_metal_pipe',   "mat_metal_pipe",   "Metal pipe"),
+    ('mat_concrete',     "mat_concrete",     "Concrete"),
+    ('mat_rock',         "mat_rock",         "Rock / stone"),
+    ('mat_wood',         "mat_wood",         "Wood"),
+    ('mat_grass',        "mat_grass",        "Grass / ground"),
+    ('mat_sand',         "mat_sand",         "Sand / dirt"),
+    ('mat_water',        "mat_water",        "Water"),
+    ('mat_glass',        "mat_glass",        "Glass"),
+    ('mat_flesh',        "mat_flesh",        "Flesh / organic (characters)"),
+    ('mat_head',         "mat_head",         "Head (characters)"),
+    ('mat_helmet',       "mat_helmet",       "Helmet / hard hat"),
+    ('mat_armor',        "mat_armor",        "Armor / hard protection"),
+    ('mat_arm',          "mat_arm",          "Arm (characters)"),
+    ('mat_leg',          "mat_leg",          "Leg (characters)"),
+    ('mat_cloth',        "mat_cloth",        "Cloth / fabric"),
+    ('mat_rubber',       "mat_rubber",       "Rubber"),
+]
+
+
+class CryMaterialProperties(PropertyGroup):
+    shader_preset: EnumProperty(
+        name="Shader",
+        description="CryEngine shader preset",
+        items=SHADER_ITEMS,
+        default='custom',
+        update=lambda self, ctx: _update_cgf_full_name(self, ctx),
+    )
+    shader_custom: StringProperty(
+        name="Custom Shader",
+        description="Custom shader name (used when Shader = Custom)",
+        default="",
+        update=lambda self, ctx: _update_cgf_full_name(self, ctx),
+    )
+    surface: EnumProperty(
+        name="Surface",
+        description="Physics surface type",
+        items=SURFACE_ITEMS,
+        default='mat_default',
+        update=lambda self, ctx: _update_cgf_full_name(self, ctx),
+    )
+
+
+def _update_cgf_full_name(self, context):
+    """Rebuild cgf_full_name whenever shader or surface changes."""
+    mat = context.material
+    if mat is None:
+        return
+    cry = mat.cry
+    shader = cry.shader_custom if cry.shader_preset == 'custom' else cry.shader_preset
+    base_name = mat.name.split('(')[0].split('/')[0]
+    full = base_name
+    if shader:
+        full += f"({shader})"
+    full += f"/{cry.surface}"
+    mat['cgf_full_name']    = full
+    mat['cgf_shader_name']  = shader
+    mat['cgf_surface_name'] = cry.surface
+
+
+class VIEW3D_PT_cryengine(Panel):
+    bl_label       = "CryEngine 1"
+    bl_idname      = "VIEW3D_PT_cryengine"
+    bl_space_type  = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category    = 'CryEngine'
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+
+        # Active material from selected mesh
+        mat = None
+        if obj and obj.type == 'MESH' and obj.active_material:
+            mat = obj.active_material
+
+        if mat is None:
+            layout.label(text="Select a mesh object", icon='INFO')
+            return
+
+        cry = mat.cry
+
+        box = layout.box()
+        box.label(text=f"Material: {mat.name}", icon='MATERIAL')
+
+        # Show current full CGF name
+        full = mat.get('cgf_full_name', '')
+        if full:
+            box.label(text=full, icon='INFO')
+
+        col = layout.column()
+        col.label(text="Shader:")
+        col.prop(cry, "shader_preset", text="")
+        if cry.shader_preset == 'custom':
+            col.prop(cry, "shader_custom", text="Name")
+
+        col.separator()
+        col.label(text="Surface / Physics:")
+        col.prop(cry, "surface", text="")
 
 
 # ── Addon Preferences ─────────────────────────────────────────────────────────
@@ -66,9 +188,9 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
     import_uvs: BoolProperty(name="Import UVs",
         description="Import texture coordinates", default=True)
     import_skeleton: BoolProperty(name="Import Skeleton",
-        description="Build armature from bone chunks", default=False)
+        description="Build armature from bone chunks", default=True)
     import_weights: BoolProperty(name="Import Vertex Weights",
-        description="Assign bone weights for skinned meshes", default=False)
+        description="Assign bone weights for skinned meshes", default=True)
     game_root_override: StringProperty(
         name="Override Game Root",
         description="Override the global Game Root Path for this import only. "
@@ -260,24 +382,30 @@ def menu_export(self, context):
 
 def register():
     bpy.utils.register_class(CGFAddonPreferences)
+    bpy.utils.register_class(CryMaterialProperties)
+    bpy.utils.register_class(VIEW3D_PT_cryengine)
     bpy.utils.register_class(ImportCGF)
     bpy.utils.register_class(ImportCAF)
     bpy.utils.register_class(ImportCAL)
     bpy.utils.register_class(ExportCGF)
     bpy.utils.register_class(ExportCAF)
     bpy.utils.register_class(ExportCAL)
+    bpy.types.Material.cry = bpy.props.PointerProperty(type=CryMaterialProperties)
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
 
 
 def unregister():
     bpy.utils.unregister_class(CGFAddonPreferences)
+    bpy.utils.unregister_class(CryMaterialProperties)
+    bpy.utils.unregister_class(VIEW3D_PT_cryengine)
     bpy.utils.unregister_class(ImportCGF)
     bpy.utils.unregister_class(ImportCAF)
     bpy.utils.unregister_class(ImportCAL)
     bpy.utils.unregister_class(ExportCGF)
     bpy.utils.unregister_class(ExportCAF)
     bpy.utils.unregister_class(ExportCAL)
+    del bpy.types.Material.cry
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
 
