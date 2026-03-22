@@ -101,17 +101,18 @@ def _set_input(node, *names, value):
 def build_material(mat_chunk, filepath, import_materials, game_root_path=""):
     if not import_materials:
         return None
-    mat = bpy.data.materials.get(mat_chunk.name)
+    full_name = _build_cgf_mat_name(mat_chunk.name,
+                                    mat_chunk.shader_name,
+                                    mat_chunk.surface_name)
+    mat = bpy.data.materials.get(full_name)
     if mat:
         return mat
 
-    mat = bpy.data.materials.new(name=mat_chunk.name)
+    mat = bpy.data.materials.new(name=full_name)
     # Store original CGF material info for round-trip export
     mat['cgf_shader_name']  = mat_chunk.shader_name
     mat['cgf_surface_name'] = mat_chunk.surface_name
-    mat['cgf_full_name']    = _build_cgf_mat_name(mat_chunk.name,
-                                                    mat_chunk.shader_name,
-                                                    mat_chunk.surface_name)
+    mat['cgf_full_name']    = full_name
     # Populate CryEngine panel properties
     if hasattr(mat, 'cry'):
         # Set shader — check if it matches a preset
@@ -265,73 +266,90 @@ def build_mesh(mesh_chunk, node_chunk, archive, collection,
     obj  = bpy.data.objects.new(name, mesh)
     collection.objects.link(obj)
 
-    bm = bmesh.new()
+    # Build the mesh from face corners, not from the raw shared vertex table.
+    # Some CryEngine meshes intentionally reuse the same geometric triangle more than once
+    # with different UV/material data; bmesh collapses those faces, which is what caused the
+    # visible UV breakage on coa_storage.cgf.
+    verts = []
+    faces = []
+    vertex_source_ids = []
+    face_texcoords = []
+    face_normals = []
+    face_material_ids = []
+    face_smooth_flags = []
 
-    # Vertices
-    # For skinned meshes, Max recalculates vertex positions using bone transforms:
-    #   p = sum(link.offset * bone.transform * link.blending) for each link
-    # link.offset is the vertex position in the bone's local space.
-    # We precompute this if bone initial positions are available.
-    for vi, cv in enumerate(mc.vertices):
-        bm.verts.new(cry_vec(cv.pos))
-    bm.verts.ensure_lookup_table()
+    for fi, cf in enumerate(mc.faces):
+        src_vis = (cf.v0, cf.v1, cf.v2)
+        if any(vi >= len(mc.vertices) for vi in src_vis):
+            continue
 
-    # Faces
-    skipped = 0
-    for cf in mc.faces:
-        if cf.v0>=len(bm.verts) or cf.v1>=len(bm.verts) or cf.v2>=len(bm.verts):
-            skipped += 1; continue
-        try:
-            f = bm.faces.new((bm.verts[cf.v0], bm.verts[cf.v1], bm.verts[cf.v2]))
-            f.smooth = True
-        except ValueError:
-            skipped += 1
-    bm.faces.ensure_lookup_table()
+        if mc.tex_faces and fi < len(mc.tex_faces):
+            tf = mc.tex_faces[fi]
+            src_tvis = (tf.t0, tf.t1, tf.t2)
+        else:
+            src_tvis = src_vis
 
-    # UVs
-    if import_uvs and mc.tex_vertices:
-        uv = bm.loops.layers.uv.new("UVMap")
-        real_fi = 0
-        for fi, cf in enumerate(mc.faces):
-            if real_fi >= len(bm.faces): break
-            face = bm.faces[real_fi]
-            real_fi += 1
+        face_indices = []
+        corner_uvs = []
+        corner_normals = []
 
-            # If texFaces exist use them, otherwise use geometry face indices (Max fallback)
-            if mc.tex_faces and fi < len(mc.tex_faces):
-                tf = mc.tex_faces[fi]
-                tv = [tf.t0, tf.t1, tf.t2]
+        for corner_idx, src_vi in enumerate(src_vis):
+            verts.append(cry_vec(mc.vertices[src_vi].pos))
+            vertex_source_ids.append(src_vi)
+            face_indices.append(len(verts) - 1)
+
+            tvi = src_tvis[corner_idx] if corner_idx < len(src_tvis) else src_vi
+            if import_uvs and tvi is not None and tvi < len(mc.tex_vertices):
+                corner_uvs.append(mc.tex_vertices[tvi])
             else:
-                tv = [cf.v0, cf.v1, cf.v2]
+                corner_uvs.append((0.0, 0.0))
 
-            for li, loop in enumerate(face.loops):
-                tvi = tv[li]
-                if tvi < len(mc.tex_vertices):
-                    u, v = mc.tex_vertices[tvi]
-                    loop[uv].uv = (u, v)
+            n = mc.vertices[src_vi].normal
+            bn = mathutils.Vector(n)
+            if bn.length > 1e-6:
+                bn.normalize()
+            else:
+                bn = mathutils.Vector((0, 0, 1))
+            corner_normals.append((bn.x, bn.y, bn.z))
 
-    bm.to_mesh(mesh)
-    bm.free()
+        faces.append(face_indices)
+        face_texcoords.append(corner_uvs)
+        face_normals.append(corner_normals)
+        face_material_ids.append(cf.mat_id)
+        face_smooth_flags.append(cf.smooth_group != 0)
+
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj["_cgf_source_vert_ids"] = vertex_source_ids
+
+    for poly_index, poly in enumerate(mesh.polygons):
+        if poly_index < len(face_smooth_flags):
+            poly.use_smooth = face_smooth_flags[poly_index]
 
     # Custom normals
-    if import_normals and mc.vertices:
-        normals = []
-        for cf in mc.faces:
-            for vi in (cf.v0, cf.v1, cf.v2):
-                if vi < len(mc.vertices):
-                    n = mc.vertices[vi].normal
-                    bn = mathutils.Vector(n)
-                    if bn.length > 1e-6: bn.normalize()
-                    normals.append(bn)
-                else:
-                    normals.append(mathutils.Vector((0, 0, 1)))
+    if import_normals and face_normals:
+        normals = [n for face in face_normals for n in face]
         try:
             if hasattr(mesh, 'use_auto_smooth'):
                 mesh.use_auto_smooth = True
+            for poly in mesh.polygons:
+                poly.use_smooth = True
             if len(normals) == len(mesh.loops):
-                mesh.normals_split_custom_set([(n.x,n.y,n.z) for n in normals])
+                mesh.normals_split_custom_set(normals)
         except Exception:
             pass
+
+    # UVs
+    if import_uvs and face_texcoords:
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        loop_index = 0
+        for poly_index, poly in enumerate(mesh.polygons):
+            corner_uvs = face_texcoords[poly_index]
+            for corner_idx in range(poly.loop_total):
+                if corner_idx < len(corner_uvs):
+                    u, v = corner_uvs[corner_idx]
+                    uv_layer.data[loop_index].uv = (u, v)
+                loop_index += 1
 
     # Materials
     # face.mat_id in CGF = global index among ALL standard materials in file,
@@ -347,17 +365,19 @@ def build_mesh(mesh_chunk, node_chunk, archive, collection,
             # Add all standard materials as slots and build matID → slot map
             slot_map = {}  # face.mat_id → mesh material slot index
             for i, std_chunk in enumerate(standard_chunks):
-                if std_chunk.name in blender_materials:
-                    bmat = blender_materials[std_chunk.name]
+                std_key = _build_cgf_mat_name(std_chunk.name,
+                                              std_chunk.shader_name,
+                                              std_chunk.surface_name)
+                if std_key in blender_materials:
+                    bmat = blender_materials[std_key]
                     if bmat.name not in [m.name for m in mesh.materials]:
                         mesh.materials.append(bmat)
                     slot_map[i] = list(mesh.materials).index(bmat)
 
             # Assign material slots to polygons
             for pi, poly in enumerate(mesh.polygons):
-                if pi < len(mc.faces):
-                    mid = mc.faces[pi].mat_id
-                    poly.material_index = slot_map.get(mid, 0)
+                if pi < len(face_material_ids):
+                    poly.material_index = slot_map.get(face_material_ids[pi], 0)
 
     # Transform
     if node_chunk and node_chunk.trans_matrix:
@@ -367,20 +387,25 @@ def build_mesh(mesh_chunk, node_chunk, archive, collection,
 
     # Vertex weights
     if import_weights and mc.physique and archive.bone_anim_chunks:
-        _assign_weights(obj, mc, archive)
+        _assign_weights(obj, mc, archive, vertex_source_ids)
 
     return obj
 
 
-def _assign_weights(obj, mc, archive):
-    print(f"[CGF] Assigning weights: {len(mc.physique)} vertices...")
+def _assign_weights(obj, mc, archive, vertex_source_ids=None):
+    print(f"[CGF] Assigning weights: {len(mc.physique)} source vertices...")
     names = {}
     if archive.bone_name_list_chunks:
         for i, n in enumerate(archive.bone_name_list_chunks[0].name_list):
             names[i] = n
-    for bl in mc.physique:
-        vid = bl.vertex_id
-        for lnk in bl.links:
+
+    links_by_source_vid = {bl.vertex_id: bl.links for bl in mc.physique}
+
+    if vertex_source_ids is None:
+        vertex_source_ids = list(range(len(mc.vertices)))
+
+    for vid, src_vid in enumerate(vertex_source_ids):
+        for lnk in links_by_source_vid.get(src_vid, []):
             bname = names.get(lnk.bone_id, f"Bone_{lnk.bone_id}")
             if bname not in obj.vertex_groups:
                 obj.vertex_groups.new(name=bname)
@@ -409,6 +434,16 @@ def _collect_standard_chunks(mat_chunk, archive, result):
 
 
 # ── Armature ──────────────────────────────────────────────────────────────────
+
+def _source_vert_map_from_object(obj):
+    values = obj.get("_cgf_source_vert_ids")
+    if not values:
+        return None
+    source_map = {}
+    for mesh_vid, src_vid in enumerate(values):
+        source_map.setdefault(int(src_vid), []).append(mesh_vid)
+    return source_map
+
 
 def build_armature(archive, collection):
     if not archive.bone_anim_chunks or not archive.bone_anim_chunks[0].bones:
@@ -475,6 +510,21 @@ def build_armature(archive, collection):
     with bpy.context.temp_override(**ctx):
         bpy.ops.object.mode_set(mode='OBJECT')
 
+    # Preserve original bone metadata for round-trip export.
+    for bone in archive.bone_anim_chunks[0].bones:
+        bid   = bone.bone_id
+        bname = names[bid] if bid < len(names) else (bone.name or f"Bone_{bid}")
+        if not arm_obj.pose or bname not in arm_obj.pose.bones:
+            continue
+        pbone = arm_obj.pose.bones[bname]
+        pbone['cry_ctrl_id'] = bone.ctrl_id
+        pbone['cry_bone_id'] = int(bone.bone_id)
+        pbone['cry_parent_id'] = int(bone.parent_id)
+        pbone['cry_custom_property'] = bone.custom_property or ""
+        if bone.bone_physics:
+            pbone['cry_bone_mesh_id'] = int(bone.bone_physics.mesh_id)
+            pbone['cry_bone_flags'] = f"{int(bone.bone_physics.flags) & 0xFFFFFFFF:08X}"
+
     # Store original CGF bone matrices on armature for round-trip export
     # Must be done AFTER exit from edit mode (data bones are accessible now)
     cgf_matrices = {}
@@ -509,12 +559,15 @@ def build_shape_keys(obj, mesh_chunk, archive):
     morphs = archive.get_morphs_for_mesh(mesh_chunk.header.chunk_id)
     if not morphs:
         return
+    source_map = _source_vert_map_from_object(obj)
     obj.shape_key_add(name="Basis", from_mix=False)
     for morph in morphs:
         sk = obj.shape_key_add(name=morph.name, from_mix=False)
         for mv in morph.target_vertices:
-            if mv.vertex_id < len(sk.data):
-                sk.data[mv.vertex_id].co = cry_vec(mv.target_point)
+            target_ids = source_map.get(mv.vertex_id, []) if source_map else [mv.vertex_id]
+            for target_id in target_ids:
+                if target_id < len(sk.data):
+                    sk.data[target_id].co = cry_vec(mv.target_point)
 
 
 # ── Animation ─────────────────────────────────────────────────────────────────
@@ -744,9 +797,11 @@ def load(operator, context, filepath,
             _collect_standard_chunks(mc, archive, standard_chunks)
             print(f"[CGF]   material chunk: {mc.name} type={mc.type} → {len(standard_chunks)} standard")
             for std in standard_chunks:
-                if std.name not in blender_materials:
+                std_key = _build_cgf_mat_name(std.name, std.shader_name, std.surface_name)
+                if std_key not in blender_materials:
                     bmat = build_material(std, filepath, import_materials, game_root_path)
-                    if bmat: blender_materials[std.name] = bmat
+                    if bmat:
+                        blender_materials[std_key] = bmat
     print(f"[CGF] Materials done: {len(blender_materials)}")
 
     # Armature
@@ -869,9 +924,11 @@ def _ensure_armature(operator, context, anim_filepath):
         standard_chunks = []
         _collect_standard_chunks(mc, archive, standard_chunks)
         for std in standard_chunks:
-            if std.name not in blender_materials:
+            std_key = _build_cgf_mat_name(std.name, std.shader_name, std.surface_name)
+            if std_key not in blender_materials:
                 bmat = build_material(std, cgf_path, True, game_root_path)
-                if bmat: blender_materials[std.name] = bmat
+                if bmat:
+                    blender_materials[std_key] = bmat
 
     for mc in archive.mesh_chunks:
         node = archive.get_node(mc.header.chunk_id)
