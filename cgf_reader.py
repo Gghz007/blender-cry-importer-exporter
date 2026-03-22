@@ -761,15 +761,15 @@ class ChunkReader:
             raise ValueError(f"Unknown file type 0x{file_type_high:04X}:0x{file_type_low:04X}")
         self._seek(16); chunk_table_pos=self._read_u32()
         self._seek(chunk_table_pos); num_chunks=self._read_u32(); hstart=self._tell()
-        headers=[]; hpos=[]
+        headers=[]
         for i in range(num_chunks):
             self._seek(hstart+i*SIZE_CHUNK_HEADER)
-            hpos.append(self._tell())
             headers.append(self._read_chunk_header())
+        headers.sort(key=lambda h: (h.file_offset, h.type, h.chunk_id))
         archive=CryChunkArchive()
         archive.geom_file_name=filepath if is_geom else ""
         for i,h in enumerate(headers):
-            next_pos=hpos[i+1] if i+1<num_chunks else chunk_table_pos
+            next_pos=headers[i+1].file_offset if i+1<num_chunks else chunk_table_pos
             print(f"[CGF] chunk {i}/{num_chunks} type=0x{h.type:04X} ver=0x{h.version:04X} offset={h.file_offset}")
             chunk=self._read_chunk(h, next_pos)
             if chunk is not None: archive.add(chunk)
