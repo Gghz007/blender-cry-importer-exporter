@@ -1,251 +1,370 @@
-# CryEngine 1 CGF Importer/Exporter for Blender
+# CryEngine 1 Import/Export Addon for Blender
 
-A Blender addon for importing and exporting **CryEngine 1 / Far Cry (2004)** geometry and animation files.
+Blender addon for working with CryEngine 1 / Far Cry era geometry and animation files.
 
-Ported from the original [CryImporter for 3ds Max 8](https://www.takaro.net) by Takaro Pty. Ltd.
+The addon focuses on practical round-trip work:
 
----
+- import geometry, materials, skeletons, weights, morph targets, and animation data
+- edit assets in Blender
+- export geometry and animation back to CryEngine 1 formats
 
-## Features
+The codebase is based on the original CryImporter / CryExport toolchain used for 3ds Max and on additional legacy CryEngine exporter references.
+
+## Supported Blender Versions
+
+- Blender 4.x
+- Blender 5.x
+
+## Supported Formats
 
 ### Import
-- `.cgf` and `.cga` geometry files (mesh, UV, normals, materials, skeleton, weights)
-- `.caf` animation files onto existing armatures
-- `.cal` animation list files (multiple animations at once)
-- **Automatic texture loading** — set your Far Cry folder once in Addon Preferences
-- Supports `.dds`, `.tga`, `.tif`, `.tiff`, `.png`, `.jpg`, `.bmp` texture formats
-- DDN normal maps → Normal Map node; `_bump` heightmaps → Bump node
-- Gloss packed in diffuse alpha (`GlossAlpha` shaders) → Specular IOR Level
+
+- `.cgf` - geometry
+- `.cga` - animated / skinned geometry
+- `.bld` - building geometry
+- `.caf` - animation
+- `.anm` - animation container handled through the same importer path as CAF
+- `.cal` - animation list
 
 ### Export
-- `.cgf` geometry files (mesh + materials + skeleton + weights)
-- `.caf` animation files from Blender Actions
-- `.cal` animation list (exports all Actions as CAF files)
-- Correct material name format with shader: `name(ShaderName)/surface`
-- Bone initial pos matrices preserved from original file (perfect round-trip)
-- Vertex colors (white by default — required by engine)
 
-### N-Panel (View3D → N → CryEngine)
-- Per-material **Shader** selector with all Far Cry shader presets
-- Per-material **Surface / Physics** selector with all Far Cry surface types
-- Shows current CGF material name in real-time
+- `.cgf` - geometry
+- `.cga` - animated / skinned geometry
+- `.bld` - building geometry
+- `.caf` - animation
+- `.anm` - animation container handled through the same exporter path as CAF
+- `.cal` - animation list
+- auto export mode that decides between geometry and animation outputs from scene contents
 
-### General
-- Correct scale: Max inches ↔ Blender meters (`× 0.0254`)
-- Supports Blender 4.0, 4.1, 4.2, 5.0+
+## Current Feature Set
 
----
+### Geometry Import
+
+- imports one or many mesh chunks from a single file as separate Blender mesh objects
+- keeps mesh objects under their source node names when available
+- imports UVs and custom split normals
+- imports material assignments per mesh and per polygon
+- imports morph targets as shape keys
+- can globally skip collision-like helper geometry based on reliable CryEngine material markers
+- creates a dedicated collection per imported asset
+
+### Material Import
+
+- creates Blender node materials from CryEngine material chunks
+- loads diffuse, bump / normal, and detail textures when found
+- supports automatic texture lookup through the configured Game Textures Path
+- supports common Far Cry texture formats: `.dds`, `.tga`, `.tif`, `.tiff`, `.png`, `.jpg`, `.bmp`
+- maps DDN textures to a normal-map workflow
+- preserves Cry shader and surface metadata on the Blender material
+- reuses equivalent materials inside a single imported file instead of creating duplicates for every mesh
+
+### Skeleton / Skin Import
+
+- imports bone hierarchy
+- imports vertex weights
+- preserves original Cry bone metadata needed for later export
+- preserves bone initial matrices for round-trip export
+- applies embedded controller data from geometry files when present so rigged assets are not left only in rest pose
+
+### Animation Import
+
+- imports CAF and ANM animation data onto an armature
+- imports CAL files and creates separate Blender actions
+- if no armature is present, the importer can auto-load the matching CGF / CGA from the same folder
+- uses controller ids from imported Cry data to match animation tracks back to bones
+
+### Geometry Export
+
+- exports visible meshes or selected meshes only
+- exports materials
+- exports skeletons and skin weights
+- exports CGF, CGA, and BLD through the geometry exporter path
+- preserves stored Cry bone matrices for better round-trip behavior
+- writes vertex colors, including default white when needed for engine compatibility
+
+### Animation Export
+
+- exports the active action to CAF
+- exports the active action to ANM through the same backend path
+- exports all action tracks as CAF files plus a CAL list
+- supports automatic asset export from a single command
+
+### Auto Export
+
+Auto export inspects the current scene and writes the most useful output automatically:
+
+- exports `.cga` for skinned meshes when that option is enabled
+- exports `.cgf` for non-skinned geometry
+- can also write `.cal` plus multiple `.caf` files when actions are present on the armature
 
 ## Installation
 
-1. Download `io_import_cgf.zip` from [Releases](../../releases)
-2. In Blender: **Edit → Preferences → Add-ons → Install...**
-3. Select the downloaded `.zip` file
-4. Enable **"CryEngine 1 CGF Importer/Exporter (Far Cry)"**
-5. Click the arrow next to the addon name and set **Game Root Path** to your Far Cry folder (e.g. `C:\FarCry`)
+1. Download or package the addon as a zip that contains the `io_import_cgf` folder.
+2. In Blender open `Edit -> Preferences -> Add-ons`.
+3. Click `Install...`.
+4. Select the addon zip.
+5. Enable `CryEngine 1 CGF Importer/Exporter (Far Cry)`.
+6. Open the addon preferences and set `Game Textures Path` to your Far Cry / CryEngine 1 game folder.
+7. Optionally enable `Skip Collision-Like Geometry` if you do not want helper / collision-like meshes to be imported by default.
 
----
+## Addon Preferences
 
-## Setup — Game Root Path
+### Game Textures Path
 
-**Edit → Preferences → Add-ons → CryEngine 1 CGF → Game Root Path**
+Set the textures path to the folder that contains directories such as:
 
-Set this to the root of your Far Cry installation — the folder that contains `Objects\`, `Textures\`, `Levels\` etc.
+- `Objects`
+- `Textures`
+- `Levels`
 
+Example:
+
+```text
+C:\FarCry
+|-- Objects
+|-- Textures
+`-- Levels
 ```
-C:\FarCry\             ← set this
-├── Objects\
-│   └── Characters\
-│       └── model.cgf
-└── Textures\
-    └── texture.tif
+
+This path is used to resolve relative texture paths stored inside CryEngine files.
+
+### Skip Collision-Like Geometry
+
+When enabled, the geometry importer skips collision-like helper content based on reliable CryEngine material markers such as:
+
+- shader `NoDraw`
+- shader `no_draw`
+- surface `mat_obstruct`
+- surface `mat_nodraw`
+- diffuse texture `nodraw.dds`
+
+This is useful when CryEngine assets contain extra proxy or collision-only geometry that you do not want cluttering the Blender scene.
+
+The filter can remove:
+
+- full helper meshes that are entirely collision-like
+- collision-like polygons inside mixed meshes
+- corresponding NoDraw helper materials
+
+## Import Workflows
+
+### Import Geometry
+
+Menu:
+
+- `File -> Import -> CryEngine Geometry (.cgf, .cga, .bld)`
+
+Options:
+
+- `Import UVs`
+- `Import Normals`
+- `Import Materials`
+- `Import Skeleton`
+- `Import Vertex Weights`
+- `Override Textures Path`
+
+Typical results:
+
+- static assets import as one or more mesh objects
+- multi-mesh assets stay split into separate Blender objects
+- rigged assets can import with armature and weights
+- embedded controller data is applied when present in the source file
+- collision-like helper meshes can be skipped globally from addon preferences
+
+### Import CAF / ANM
+
+Menu:
+
+- `File -> Import -> CryEngine Animation (.caf)`
+- `File -> Import -> CryEngine Animation (.anm)`
+
+Workflow:
+
+1. Import the source geometry first, or select an existing armature.
+2. Import the animation file.
+3. The addon creates or updates a Blender action on the target armature.
+
+If no armature exists, the importer tries to find a matching `.cgf` or `.cga` in the same folder and imports it automatically.
+
+### Import CAL
+
+Menu:
+
+- `File -> Import -> CryEngine Animation List (.cal)`
+
+Workflow:
+
+1. Import or select the target armature.
+2. Import the CAL file.
+3. The addon resolves the listed CAF files and creates Blender actions for them.
+
+## Export Workflows
+
+### Export CGF
+
+Menu:
+
+- `File -> Export -> CryEngine Geometry (.cgf)`
+
+Use for:
+
+- static props
+- geometry without character-style animation playback
+
+Options:
+
+- `Selected Only`
+- `Export Materials`
+- `Export Skeleton`
+- `Export Vertex Weights`
+
+### Export CGA
+
+Menu:
+
+- `File -> Export -> CryEngine Animated Geometry (.cga)`
+
+Use for:
+
+- skinned meshes
+- animated or character-style geometry
+
+Options:
+
+- `Selected Only`
+- `Export Materials`
+- `Export Skeleton`
+- `Export Vertex Weights`
+
+### Export BLD
+
+Menu:
+
+- `File -> Export -> CryEngine Building (.bld)`
+
+Use for:
+
+- building / level geometry
+
+Defaults:
+
+- skeleton export disabled
+- weight export disabled
+
+### Export CAF / ANM
+
+Menu:
+
+- `File -> Export -> CryEngine Animation (.caf)`
+- `File -> Export -> CryEngine Animation (.anm)`
+
+Workflow:
+
+1. Select the armature.
+2. Make sure the desired action is active.
+3. Export the animation.
+
+### Export CAL
+
+Menu:
+
+- `File -> Export -> CryEngine Animation List (.cal)`
+
+Workflow:
+
+1. Keep all needed actions in the Blender file.
+2. Export CAL.
+3. The addon writes the CAL file and companion CAF files for eligible actions.
+
+### Auto Export
+
+Menu:
+
+- `File -> Export -> CryEngine Auto Export`
+
+Useful when:
+
+- you want the addon to decide whether geometry should be written as CGF or CGA
+- you want geometry plus animation set export from a single command
+
+Options:
+
+- `Selected Only`
+- `Export Materials`
+- `Export CAL/CAF When Present`
+- `Use CGA For Skinned Meshes`
+
+## CryEngine Material Panel
+
+Open:
+
+- `View3D -> N Panel -> CryEngine`
+
+Per-material properties:
+
+- shader preset
+- custom shader name
+- surface / physics material
+
+The panel also rebuilds the full Cry material name in the expected format:
+
+```text
+material_name(ShaderName)/surface_name
 ```
 
-Textures are stored in CGF as relative paths (e.g. `Objects\Characters\...\texture.dds`). The addon tries all supported formats automatically — so `.dds` references will also find `.tif` files.
+Example:
 
----
-
-## Import Usage
-
-### CGF / CGA — Geometry
-
-**File → Import → CryEngine Geometry (.cgf, .cga)**
-
-| Option | Default | Description |
-|---|---|---|
-| Import UVs | ✓ | Import texture coordinates |
-| Import Normals | ✓ | Use normals from file |
-| Import Materials | ✓ | Create Principled BSDF materials and load textures |
-| Import Skeleton | ✓ | Build armature from bone chunks |
-| Import Vertex Weights | ✓ | Assign bone weights |
-| Override Game Root | — | Override the global path for this import only |
-
-**Workflow for characters:**
-1. Import CGF with skeleton enabled
-2. Then import CAF or CAL animations on the existing armature
-
----
-
-### CAF — Animation
-
-**File → Import → CryEngine Animation (.caf)**
-
-Imports one animation onto the active/existing armature in the scene.
-If no armature exists, automatically imports the matching CGF from the same folder.
-
----
-
-### CAL — Animation List
-
-**File → Import → CryEngine Animation List (.cal)**
-
-Imports all animations listed in the CAL file as separate Blender Actions.
-Switch between them in the **Action Editor**.
-
----
-
-## Export Usage
-
-### CGF — Geometry
-
-**File → Export → CryEngine Geometry (.cgf)**
-
-| Option | Default | Description |
-|---|---|---|
-| Selected Only | — | Export only selected mesh objects |
-| Export Materials | ✓ | Write material chunks |
-| Export Skeleton | ✓ | Write bone chunks from visible armature |
-| Export Vertex Weights | ✓ | Write physique (bone weights) |
-
-**Round-trip workflow (import → modify → export):**
-1. Import CGF — bone matrices and material shader names are stored automatically
-2. Modify mesh/materials in Blender
-3. Export — all original data is preserved correctly
-
----
-
-### CAF — Animation
-
-**File → Export → CryEngine Animation (.caf)**
-
-Select the armature, set the active Action in the Action Editor, then export.
-
----
-
-### CAL — Animation List
-
-**File → Export → CryEngine Animation List (.cal)**
-
-Exports all Actions with bone curves as individual CAF files + a CAL list file.
-
----
-
-## Material Setup (N-Panel)
-
-Open the **N panel → CryEngine** tab in the 3D viewport. Select a mesh object to see and edit its active material's CryEngine properties.
-
-### Shaders
-
-| Shader | Use for |
-|---|---|
-| `TemplModelCommon` | Standard props, weapons, vehicles — no bump map |
-| `TemplBumpDiffuse` | Props with normal map, no specular |
-| `TemplBumpSpec` | Props with normal map + specular |
-| `TemplBumpSpec_GlossAlpha` | Characters, props with gloss in diffuse alpha |
-| `TemplBumpSpec_HP_GlossAlpha` | Hi-poly characters with gloss in alpha |
-| `Phong` | Simple shading, legacy objects |
-| `NoDraw` | Invisible — collision/physics geometry only |
-| `Glass` | Windows, transparent surfaces |
-| `Vegetation` | Trees, bushes, foliage |
-| `Terrain` | Terrain blend layers |
-
-### Surface / Physics
-
-| Surface | Use for |
-|---|---|
-| `mat_default` | General purpose — most props |
-| `mat_metal` | Generic metal |
-| `mat_metal_plate` | Metal panels, armor plates |
-| `mat_metal_pipe` | Pipes, rails |
-| `mat_concrete` | Concrete walls, floors |
-| `mat_rock` | Rock, stone |
-| `mat_wood` | Wood planks, crates |
-| `mat_grass` | Grass, ground |
-| `mat_sand` | Sand, dirt |
-| `mat_water` | Water surfaces |
-| `mat_glass` | Glass |
-| `mat_flesh` | Character body (organic) |
-| `mat_head` | Character head |
-| `mat_helmet` | Hard hat / helmet |
-| `mat_armor` | Armor, hard protection |
-| `mat_arm` | Character arm |
-| `mat_leg` | Character leg |
-| `mat_cloth` | Fabric, clothing |
-
-**Material name format in CGF:**
+```text
+s_mut_abrr(TemplBumpSpec_GlossAlpha)/mat_default
 ```
-materialname(ShaderName)/surfaceName
-```
-Example: `s_mut_abrr(TemplBumpSpec_GlossAlpha)/mat_default`
 
-The N-panel builds this automatically. Without a valid shader name the engine will not render the mesh.
+## Texture Slots Used by the Addon
 
----
+- slot 1: diffuse
+- slot 4: bump / normal
+- slot 9: detail / height
 
-## Texture Slots
+## Round-Trip Notes
 
-| CGF Slot | Name | Usage |
-|---|---|---|
-| 1 | Diffuse | Main color texture (`.dds`) |
-| 4 | Bump | Normal map — suffix `_ddn` |
-| 9 | Detail | Height/bump map — suffix `_bump` |
+The addon stores extra CryEngine metadata on imported data where possible:
 
----
+- shader name
+- surface name
+- full Cry material name
+- controller ids
+- bone ids and parent ids
+- bone initial matrices
 
-## Coordinate System & Scale
-
-- **Scale:** `1 Max inch = 0.0254 Blender meters` — applied automatically
-- **Axes:** Z-up in both CryEngine and Blender — compatible
-- **Bone matrices:** Original world-space matrices preserved for correct round-trip export
-
----
-
-## Supported Chunk Types
-
-| Chunk | Description |
-|---|---|
-| `0x0000` Mesh | Geometry, UVs, normals, vertex colors, bone weights, BoneInitialPos |
-| `0x000B` Node | Scene hierarchy and transform |
-| `0x000C` Material | Colors, shader name, texture paths (v745/v746) |
-| `0x0003` BoneAnim | Skeleton definition (152 bytes/bone) |
-| `0x0005` BoneNameList | Bone names |
-| `0x000D` Controller | Animation keys (v826/v827) |
-| `0x000F` BoneMesh | Bone physics collision meshes |
-| `0x0011` MeshMorphTarget | Shape keys / facial expressions |
-| `0x0012` BoneInitialPos | Bone rest pose matrices (embedded in Mesh chunk) |
-| `0x000E` Timing | Animation timing / FPS |
-| `0x0013` SourceInfo | Source file metadata |
-
----
+This improves export fidelity when you import a CryEngine asset, edit it, and export it again.
 
 ## Known Limitations
 
-- BSpline controller types not supported (rare in Far Cry assets)
-- VertAnim (vertex animation) not exported
-- Bone physics constraints exported as zeros (engine uses defaults)
-- New rigs from scratch may need bone matrix adjustment for perfect skinning
+- some legacy controller types are still uncommon and may not be fully covered in every asset
+- CryEngine format edge cases can still exist on unusual assets from old pipelines
+- engine-side crashes are usually caused by malformed chunk structure, invalid hierarchy data, or mismatched animation / skeleton data; the addon is being aligned against legacy exporter references to reduce those cases
+- very custom material graphs in Blender will not map back to CryEngine 1 one-to-one
 
----
+## Recommended Usage
+
+For geometry only:
+
+1. Import CGF or BLD.
+2. Edit mesh or materials.
+3. Export CGF or BLD.
+
+For rigged assets:
+
+1. Import CGA or skinned CGF with skeleton and weights enabled.
+2. Verify the imported armature and material assignments.
+3. Import CAF / ANM / CAL if needed.
+4. Edit the mesh, rig, or actions.
+5. Export CGA, CAF, ANM, or CAL as needed.
 
 ## Credits
 
-- Original **CryImporter for 3ds Max** by [Takaro Pty. Ltd.](https://www.takaro.net)
-- Binary format verified against original Far Cry game files
-- Blender addon port — this project
-
----
+- original CryImporter / CryExport pipeline by Takaro Pty. Ltd. and legacy CryEngine tool authors
+- Blender addon port and ongoing compatibility work in this project
 
 ## License
 
-Based on CryImporter by Takaro Pty. Ltd. — original license terms apply.
-Free for non-commercial use. See `LICENSE` for details.
+See [LICENSE](LICENSE).
