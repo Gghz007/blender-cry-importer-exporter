@@ -148,19 +148,25 @@ class CGFAddonPreferences(AddonPreferences):
     bl_idname = __name__
 
     game_root_path: StringProperty(
-        name="Game Root Path",
-        description="Root folder of Far Cry installation (where Objects/, Textures/ etc. are). "
-                    "Used globally for all CGF imports to find textures automatically.",
+        name="Game Textures Path",
+        description="Folder used to resolve CryEngine texture paths during import. "
+                    "Point this to your Far Cry game data root so the addon can find textures automatically.",
         default="",
         subtype='DIR_PATH',
+    )
+    skip_collision_geometry: BoolProperty(
+        name="Skip Collision-Like Geometry",
+        description="Globally skip collision-like helper geometry such as NoDraw or obstruct meshes during geometry import",
+        default=False,
     )
 
     def draw(self, context):
         layout = self.layout
         layout.label(text="Far Cry / CryEngine 1 Settings:", icon='SETTINGS')
         layout.prop(self, "game_root_path")
+        layout.prop(self, "skip_collision_geometry")
         if not self.game_root_path:
-            layout.label(text="⚠  Set this to your Far Cry install folder (e.g. C:\\FarCry)",
+            layout.label(text="Set this to your Far Cry textures/data folder (e.g. C:\\FarCry)",
                          icon='ERROR')
 
 
@@ -170,6 +176,13 @@ def get_game_root_path():
     if prefs:
         return prefs.preferences.game_root_path
     return ""
+
+
+def get_skip_collision_geometry():
+    prefs = bpy.context.preferences.addons.get(__name__)
+    if prefs:
+        return bool(getattr(prefs.preferences, "skip_collision_geometry", False))
+    return False
 
 
 def _scene_meshes(context, selected_only=False):
@@ -233,8 +246,8 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
     import_weights: BoolProperty(name="Import Vertex Weights",
         description="Assign bone weights for skinned meshes", default=True)
     game_root_override: StringProperty(
-        name="Override Game Root",
-        description="Override the global Game Root Path for this import only. "
+        name="Override Textures Path",
+        description="Override the global Game Textures Path for this import only. "
                     "Leave empty to use the path from Addon Preferences.",
         default="",
         subtype='DIR_PATH',
@@ -252,6 +265,7 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
             import_skeleton  = self.import_skeleton,
             import_weights   = self.import_weights,
             game_root_path   = game_root,
+            skip_collision_geometry = get_skip_collision_geometry(),
         )
         if result == {'FINISHED'}:
             for obj in context.scene.objects:
@@ -275,9 +289,9 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
         box.label(text="Textures", icon='TEXTURE')
         global_root = get_game_root_path()
         if global_root:
-            box.label(text=f"Global root: {global_root}", icon='CHECKMARK')
+            box.label(text=f"Global textures: {global_root}", icon='CHECKMARK')
         else:
-            box.label(text="No global root set (see Addon Preferences)", icon='ERROR')
+            box.label(text="No global textures path set (see Addon Preferences)", icon='ERROR')
         box.prop(self, "game_root_override")
 
 
