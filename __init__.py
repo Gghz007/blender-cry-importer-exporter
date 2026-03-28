@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CryEngine 1 CGF Importer/Exporter (Far Cry)",
     "author": "Ported from Takaro CryImporter for 3ds Max",
-    "version": (1, 2, 0),
+    "version": (1, 4, 14),
     "blender": (4, 0, 0),
     "location": "File > Import/Export > CryEngine",
     "description": "Import/Export CryEngine 1 / Far Cry geometry and animation files",
@@ -16,6 +16,9 @@ from bpy_extras.io_utils import ImportHelper, ExportHelper
 from . import cgf_reader
 from . import cgf_builder
 from . import cgf_exporter
+
+
+ADDON_BUILD_TAG = "v193-clean-plus-root"
 
 
 # ── CryEngine Material Properties ─────────────────────────────────────────────
@@ -148,9 +151,9 @@ class CGFAddonPreferences(AddonPreferences):
     bl_idname = __name__
 
     game_root_path: StringProperty(
-        name="Game Textures Path",
-        description="Folder used to resolve CryEngine texture paths during import. "
-                    "Point this to your Far Cry game data root so the addon can find textures automatically.",
+        name="Game Data/Textures Root",
+        description="Root folder used to resolve CryEngine texture paths (Objects/Textures/Levels). "
+                    "Point this to your Far Cry game data root.",
         default="",
         subtype='DIR_PATH',
     )
@@ -159,14 +162,20 @@ class CGFAddonPreferences(AddonPreferences):
         description="Globally skip collision-like helper geometry such as NoDraw or obstruct meshes during geometry import",
         default=False,
     )
+    enable_scene_setup: BoolProperty(
+        name="Enable Full Scene Setup",
+        description="Single master switch for asset root, node transforms, helper/controller targets, and producer cameras",
+        default=True,
+    )
 
     def draw(self, context):
         layout = self.layout
         layout.label(text="Far Cry / CryEngine 1 Settings:", icon='SETTINGS')
         layout.prop(self, "game_root_path")
         layout.prop(self, "skip_collision_geometry")
+        layout.prop(self, "enable_scene_setup")
         if not self.game_root_path:
-            layout.label(text="Set this to your Far Cry textures/data folder (e.g. C:\\FarCry)",
+            layout.label(text="Set this to your Far Cry data root (e.g. C:\\FarCry)",
                          icon='ERROR')
 
 
@@ -183,6 +192,13 @@ def get_skip_collision_geometry():
     if prefs:
         return bool(getattr(prefs.preferences, "skip_collision_geometry", False))
     return False
+
+
+def _get_pref_bool(name, default=False):
+    prefs = bpy.context.preferences.addons.get(__name__)
+    if prefs:
+        return bool(getattr(prefs.preferences, name, default))
+    return bool(default)
 
 
 def _scene_meshes(context, selected_only=False):
@@ -219,7 +235,10 @@ def _actions_for_armature(arm_obj):
         return []
     result = []
     for action in bpy.data.actions:
-        if any(fc.data_path.startswith('pose.bones[') for fc in action.fcurves):
+        fcurves = getattr(action, 'fcurves', None)
+        if not fcurves:
+            continue
+        if any(fc.data_path.startswith('pose.bones[') for fc in fcurves):
             result.append(action)
     return result
 
@@ -246,8 +265,8 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
     import_weights: BoolProperty(name="Import Vertex Weights",
         description="Assign bone weights for skinned meshes", default=True)
     game_root_override: StringProperty(
-        name="Override Textures Path",
-        description="Override the global Game Textures Path for this import only. "
+        name="Override Data/Textures Root",
+        description="Override the global Game Data/Textures Root for this import only. "
                     "Leave empty to use the path from Addon Preferences.",
         default="",
         subtype='DIR_PATH',
@@ -266,6 +285,13 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
             import_weights   = self.import_weights,
             game_root_path   = game_root,
             skip_collision_geometry = get_skip_collision_geometry(),
+            create_asset_root_empty = _get_pref_bool("enable_scene_setup", True),
+            apply_armature_node_transform = _get_pref_bool("enable_scene_setup", True),
+            apply_mesh_node_transform = _get_pref_bool("enable_scene_setup", True),
+            preserve_mesh_world_on_armature_parent = _get_pref_bool("enable_scene_setup", True),
+            create_helper_nodes = _get_pref_bool("enable_scene_setup", True),
+            create_controller_targets = _get_pref_bool("enable_scene_setup", True),
+            create_producer_cameras = _get_pref_bool("enable_scene_setup", True),
         )
         if result == {'FINISHED'}:
             for obj in context.scene.objects:
@@ -289,9 +315,9 @@ class ImportCGF(bpy.types.Operator, ImportHelper):
         box.label(text="Textures", icon='TEXTURE')
         global_root = get_game_root_path()
         if global_root:
-            box.label(text=f"Global textures: {global_root}", icon='CHECKMARK')
+            box.label(text=f"Global data root: {global_root}", icon='CHECKMARK')
         else:
-            box.label(text="No global textures path set (see Addon Preferences)", icon='ERROR')
+            box.label(text="No global data root set (see Addon Preferences)", icon='ERROR')
         box.prop(self, "game_root_override")
 
 
@@ -327,12 +353,20 @@ class ImportCAF(bpy.types.Operator, ImportHelper):
 
     append: BoolProperty(name="Append to Timeline",
         description="Add after existing animation range", default=True)
+    debug_caf: BoolProperty(
+        name="Debug CAF (log transforms)",
+        description="Print detailed CAF transform diagnostics to Blender console",
+        default=False,
+    )
 
     def execute(self, context):
-        return cgf_builder.load_caf(self, context, self.filepath, self.append)
+        return cgf_builder.load_caf(
+            self, context, self.filepath, self.append, self.debug_caf
+        )
 
     def draw(self, context):
         self.layout.prop(self, "append")
+        self.layout.prop(self, "debug_caf")
 
 
 class ImportANM(bpy.types.Operator, ImportHelper):
@@ -346,13 +380,21 @@ class ImportANM(bpy.types.Operator, ImportHelper):
 
     append: BoolProperty(name="Append to Timeline",
         description="Add after existing animation range", default=True)
+    debug_caf: BoolProperty(
+        name="Debug ANM (log transforms)",
+        description="Print detailed ANM/CAF transform diagnostics to Blender console",
+        default=False,
+    )
 
     def execute(self, context):
         # CE1 ANM is treated here as the same animation container class as CAF.
-        return cgf_builder.load_caf(self, context, self.filepath, self.append)
+        return cgf_builder.load_caf(
+            self, context, self.filepath, self.append, self.debug_caf
+        )
 
     def draw(self, context):
         self.layout.prop(self, "append")
+        self.layout.prop(self, "debug_caf")
 
 
 # ── CAL animation list importer ───────────────────────────────────────────────
@@ -365,9 +407,17 @@ class ImportCAL(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".cal"
     filter_glob: StringProperty(default="*.cal", options={'HIDDEN'})
+    debug_caf: BoolProperty(
+        name="Debug CAL/CAF (log transforms)",
+        description="Print detailed CAF transform diagnostics for animations loaded from CAL",
+        default=False,
+    )
 
     def execute(self, context):
-        return cgf_builder.load_cal(self, context, self.filepath)
+        return cgf_builder.load_cal(self, context, self.filepath, self.debug_caf)
+
+    def draw(self, context):
+        self.layout.prop(self, "debug_caf")
 
 
 # ── CGF exporter ──────────────────────────────────────────────────────────────
@@ -585,9 +635,14 @@ class ExportCAF(bpy.types.Operator, ExportHelper):
 
     filename_ext = ".caf"
     filter_glob: StringProperty(default="*.caf", options={'HIDDEN'})
+    debug_export: BoolProperty(
+        name="Debug Export CAF",
+        description="Log action range and per-bone exported key counts to the Blender console",
+        default=False,
+    )
 
     def execute(self, context):
-        return cgf_exporter.export_caf(self, context, self.filepath)
+        return cgf_exporter.export_caf(self, context, self.filepath, debug_export=self.debug_export)
 
 
 class ExportANM(bpy.types.Operator, ExportHelper):
@@ -598,10 +653,15 @@ class ExportANM(bpy.types.Operator, ExportHelper):
 
     filename_ext = ".anm"
     filter_glob: StringProperty(default="*.anm", options={'HIDDEN'})
+    debug_export: BoolProperty(
+        name="Debug Export ANM",
+        description="Log action range and per-bone exported key counts to the Blender console",
+        default=False,
+    )
 
     def execute(self, context):
         # Current backend writes the generic CE1 animation container used by CAF/ANM.
-        return cgf_exporter.export_caf(self, context, self.filepath)
+        return cgf_exporter.export_caf(self, context, self.filepath, debug_export=self.debug_export)
 
 
 # ── CAL exporter ──────────────────────────────────────────────────────────────
@@ -639,6 +699,7 @@ def menu_export(self, context):
 
 
 def register():
+    print(f"[CGF] Addon build: {ADDON_BUILD_TAG}")
     bpy.utils.register_class(CGFAddonPreferences)
     bpy.utils.register_class(CryMaterialProperties)
     bpy.utils.register_class(VIEW3D_PT_cryengine)
