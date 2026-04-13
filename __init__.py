@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CryEngine 1 Asset Importer/Exporter (Far Cry)",
     "author": "Ported from Takaro CryImporter for 3ds Max",
-    "version": (1, 4, 14),
+    "version": (1, 4, 31),
     "blender": (4, 0, 0),
     "location": "File > Import/Export > CryEngine",
     "description": "Import/Export CryEngine 1 / Far Cry asset, geometry, skeleton, and animation files",
@@ -18,7 +18,15 @@ from . import cry_asset_builder
 from . import cry_exporter
 
 
-ADDON_BUILD_TAG = "v227-asset-module-rename"
+ADDON_BUILD_TAG = "v244-next-fixes-readme"
+
+
+PLAYBACK_MODE_ITEMS = [
+    ('MAXSPACE', "Maxspace Preview", "Bake mesh preview directly from Cry max-space pose evaluation"),
+    ('PROXY', "Proxy-First Preview", "Drive animation through Cry-style proxy transforms and bake mesh preview"),
+    ('ARMATURE', "Armature Keys", "Apply animation directly to Blender pose bones"),
+    ('RAWMAX', "Raw Max Keys", "Apply animation from raw Max-style controller evaluation without the current Cry evaluator path"),
+]
 
 
 # ── CryEngine Material Properties ─────────────────────────────────────────────
@@ -359,15 +367,22 @@ class ImportCAF(bpy.types.Operator, ImportHelper):
         description="Print detailed CAF transform diagnostics to Blender console",
         default=False,
     )
+    playback_mode: EnumProperty(
+        name="Animation Playback Mode",
+        description="Choose how Cry bone animation is evaluated inside Blender",
+        items=PLAYBACK_MODE_ITEMS,
+        default='MAXSPACE',
+    )
 
     def execute(self, context):
         return cry_asset_builder.load_caf(
-            self, context, self.filepath, self.append, self.debug_caf
+            self, context, self.filepath, self.append, self.debug_caf, self.playback_mode
         )
 
     def draw(self, context):
         self.layout.prop(self, "append")
         self.layout.prop(self, "debug_caf")
+        self.layout.prop(self, "playback_mode")
 
 
 class ImportANM(bpy.types.Operator, ImportHelper):
@@ -386,16 +401,23 @@ class ImportANM(bpy.types.Operator, ImportHelper):
         description="Print detailed ANM/CAF transform diagnostics to Blender console",
         default=False,
     )
+    playback_mode: EnumProperty(
+        name="Animation Playback Mode",
+        description="Choose how Cry bone animation is evaluated inside Blender",
+        items=PLAYBACK_MODE_ITEMS,
+        default='MAXSPACE',
+    )
 
     def execute(self, context):
         # CE1 ANM is treated here as the same animation container class as CAF.
         return cry_asset_builder.load_caf(
-            self, context, self.filepath, self.append, self.debug_caf
+            self, context, self.filepath, self.append, self.debug_caf, self.playback_mode
         )
 
     def draw(self, context):
         self.layout.prop(self, "append")
         self.layout.prop(self, "debug_caf")
+        self.layout.prop(self, "playback_mode")
 
 
 # ── CAL animation list importer ───────────────────────────────────────────────
@@ -413,12 +435,19 @@ class ImportCAL(bpy.types.Operator, ImportHelper):
         description="Print detailed CAF transform diagnostics for animations loaded from CAL",
         default=False,
     )
+    playback_mode: EnumProperty(
+        name="Animation Playback Mode",
+        description="Choose how Cry bone animation is evaluated inside Blender",
+        items=PLAYBACK_MODE_ITEMS,
+        default='MAXSPACE',
+    )
 
     def execute(self, context):
-        return cry_asset_builder.load_cal(self, context, self.filepath, self.debug_caf)
+        return cry_asset_builder.load_cal(self, context, self.filepath, self.debug_caf, self.playback_mode)
 
     def draw(self, context):
         self.layout.prop(self, "debug_caf")
+        self.layout.prop(self, "playback_mode")
 
 
 # ── CGF exporter ──────────────────────────────────────────────────────────────
