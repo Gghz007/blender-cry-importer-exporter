@@ -11,7 +11,8 @@ The addon focuses on practical round-trip work:
 Important status note:
 
 - geometry import/export is currently the stable path
-- CAF/ANM/CAL import is currently broken for many assets and can produce wrong poses/rotations
+- CGF skeleton bind/rest import is now much closer to Cry bind space than in earlier revisions
+- CAF/ANM/CAL import still has unresolved evaluator-space issues on real assets and can produce visually wrong motion
 - do not rely on CAF/ANM/CAL import results for production
 
 The codebase is based on the original CryImporter / CryExport toolchain used for 3ds Max and on additional legacy CryEngine exporter references.
@@ -72,11 +73,12 @@ The codebase is based on the original CryImporter / CryExport toolchain used for
 - preserves bone initial matrices for round-trip export
 - applies embedded controller data from geometry files when present so rigged assets are not left only in rest pose
 
-### Animation Import (Currently Broken)
+### Animation Import (Experimental / Debug-Oriented)
 
 - importer can parse CAF/ANM/CAL and create actions
-- but resulting motion/pose can be wrong (twisted bones, wrong orientation, wrong offsets)
-- current behavior does not consistently match legacy 3ds Max CryImporter
+- bind/rest alignment is much better than before
+- but resulting motion/pose can still be wrong on real assets
+- current behavior does not yet consistently match legacy 3ds Max CryImporter on controller evaluation
 
 ### Geometry Export
 
@@ -173,12 +175,15 @@ Current state:
 Most likely reason:
 
 - transform-space mismatch between Max evaluation chain and Blender bone application path
-- keys are parsed, but final space conversion/application is not yet reliable for all rigs
+- keys are parsed, but final controller evaluation and space conversion/application are not yet reliable for all rigs
+- the remaining issue appears to be concentrated in the evaluator layer rather than in CGF skin import
 
 Practical meaning:
 
 - use Blender import for geometry/material/weights
-- treat CAF/ANM/CAL import output as non-authoritative until this path is fixed
+- treat CAF/ANM/CAL import output as non-authoritative until evaluator work is completed
+- prefer `Armature Keys` for normal testing
+- use preview/debug paths only to compare math and isolate regressions
 
 ## Import Workflows
 
@@ -205,22 +210,46 @@ Typical results:
 - embedded controller data is applied when present in the source file
 - collision-like helper meshes can be skipped globally from addon preferences
 
-### Import CAF / ANM (Known Broken)
+### Import CAF / ANM (Experimental)
 
 Menu:
 
 - `File -> Import -> CryEngine Animation (.caf)`
 - `File -> Import -> CryEngine Animation (.anm)`
 
-Workflow still exists, but output may be wrong. Use only for debugging.
+Workflow still exists, but output may be wrong. Use primarily for debugging and comparison against Max/Cry reference behavior.
 
-### Import CAL (Known Broken)
+### Import CAL (Experimental)
 
 Menu:
 
 - `File -> Import -> CryEngine Animation List (.cal)`
 
-Workflow still exists, but output may be wrong. Use only for debugging.
+Workflow still exists, but output may be wrong. Use primarily for debugging and comparison against Max/Cry reference behavior.
+
+## Animation Playback Modes
+
+The addon currently exposes multiple animation playback/application modes. These modes exist mainly to isolate where the Cry/Max pipeline diverges from Blender and should not all be treated as long-term end-user features.
+
+### Armature Keys
+
+- writes animation onto Blender pose bones
+- this is the intended long-term user-facing workflow
+- best mode for graph editor work, manual cleanup, and export
+
+### Maxspace Preview
+
+- evaluates deformation through a Cry/Max-like preview path
+- useful for comparing Cry-style deformation against Blender pose-bone results
+- mainly a diagnostic/debug mode
+
+### Why The Modes Are Different
+
+- they separate controller evaluation
+- Blender pose application
+- final skinned mesh deformation
+
+This split was useful because the project reached a state where bind/rest alignment and deformation checks became nearly exact, while the visible animation result could still be wrong. That points at controller evaluation / pose application rather than mesh skinning itself.
 
 ## Export Workflows
 
