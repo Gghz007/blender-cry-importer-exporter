@@ -861,9 +861,6 @@ def _set_pose_from_anim_pose_matrix(pbone, local_m):
         return
     try:
         rest_local = _bone_rest_local_matrix(pbone)
-        # Keep the Max-style local PRS contract as a single local basis delta.
-        # Decomposing through Blender's location/rotation/scale path is what
-        # tends to split root/root1 even when the bind matrices already match.
         pbone.matrix_basis = rest_local.inverted_safe() @ local_m
         return
     except Exception:
@@ -871,33 +868,6 @@ def _set_pose_from_anim_pose_matrix(pbone, local_m):
     try:
         rest_local = _bone_rest_local_matrix(pbone)
         pbone.matrix_basis = rest_local.inverted_safe() @ local_m
-    except Exception:
-        pass
-
-
-def _set_pose_from_world_matrix(pbone, world_m):
-    if pbone is None or world_m is None:
-        return
-    try:
-        pbone.matrix = world_m
-        return
-    except Exception:
-        pass
-    try:
-        bone = getattr(pbone, "bone", None)
-        parent = getattr(pbone, "parent", None)
-        if bone is None:
-            return
-        parent_pose = parent.matrix.copy() if parent is not None else mathutils.Matrix.Identity(4)
-        parent_rest = parent.bone.matrix_local.copy() if parent is not None else mathutils.Matrix.Identity(4)
-        local_m = bone.convert_local_to_pose(
-            world_m,
-            bone.matrix_local,
-            parent_matrix=parent_pose,
-            parent_matrix_local=parent_rest,
-            invert=True,
-        )
-        pbone.matrix = local_m
     except Exception:
         pass
 
@@ -1072,25 +1042,11 @@ def _reset_pose_bones_to_rest(arm_obj, bone_names=None):
 
 
 def _crybone_local_transform_from_key(ctrl_chunk, key):
-    if hasattr(key, 'rel_pos'):
-        pos = key.rel_pos
-        q = cry_quat(key.rel_quat)
-        pos_vec = _cry_anim_pos_to_blender((
-            pos[0] * INCHES_TO_METERS,
-            pos[1] * INCHES_TO_METERS,
-            pos[2] * INCHES_TO_METERS,
-        ))
-        quat = _cry_anim_quat_to_blender(mathutils.Quaternion((q.w, q.x, q.y, q.z)))
-        return _compose_trs_matrix(
-            pos_vec,
-            quat,
-            mathutils.Vector((1.0, 1.0, 1.0)),
-        )
-
-    # v827 CryBone keys are authored as direct local PRS on the Max node.
-    # Match the original CryImporter semantics: exp(rotLog), not the earlier
-    # half-angle experimental path.
-    return _v827_local_from_key(key, half_rot=False)
+    # Keep one Max-compatible transform path for both v826 (rel_pos/rel_quat)
+    # and v827 (pos/rotLog): build raw Max local PRS, then convert matrix
+    # to Blender. This mirrors the legacy Max CryImporter semantics and avoids
+    # per-format axis hacks that can distort child bone chains.
+    return _raw_max_matrix_to_blender(_raw_max_local_from_key(key))
 
 
 def _v827_hybrid_local_transform(bone_name, ctrl_chunk, key, bind_local, first_key=None):
@@ -1182,11 +1138,16 @@ def _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, *, half_rot=False, bo
     return _compose_trs_matrix(loc, rot, scl)
 
 
-def _evaluate_crybone_controller_at_time(ctrl_chunk, time_tick, default_local=None):
+def _evaluate_crybone_controller_at_time(ctrl_chunk, time_tick, default_local=None, bone_name=None, evaluator_mode="DEFAULT"):
     keys = _effective_ctrl_keys(ctrl_chunk)
     if not keys:
         return default_local.copy() if default_local is not None else mathutils.Matrix.Identity(4)
-    is_v827 = not hasattr(keys[0], 'rel_pos')
+
+    mode = str(evaluator_mode or "DEFAULT").strip().upper()
+    if mode == "RAWMAX":
+        return _raw_max_matrix_to_blender(
+            _evaluate_raw_max_controller_at_time(ctrl_chunk, time_tick)
+        )
 
     if len(keys) == 1:
         local_m = _crybone_local_transform_from_key(ctrl_chunk, keys[0])
@@ -1224,7 +1185,7 @@ def _evaluate_crybone_controller_at_time(ctrl_chunk, time_tick, default_local=No
     return local_m
 
 
-def _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick):
+def _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick, evaluator_mode="DEFAULT"):
     pose = {}
     ordered = sorted(bind_pose.items(), key=lambda kv: kv[1]["bone_id"])
     for bone_name, item in ordered:
@@ -1232,16 +1193,9 @@ def _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick):
         ctrl_chunk = ctrl_by_bone.get(bone_name)
         local_m = default_local.copy()
         if ctrl_chunk is not None:
-            keys = getattr(ctrl_chunk, 'keys', None) or []
-            is_v827 = bool(keys) and not hasattr(keys[0], 'rel_pos')
-            if is_v827 and bone_name.lower() in V827_ABSOLUTE_BONES:
-                local_m = _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, half_rot=False, bone_name=bone_name)
-            elif is_v827:
-                local_m = _evaluate_v827_absolute_at_time(ctrl_chunk, time_tick, half_rot=False, bone_name=bone_name)
-            else:
-                local_m = _evaluate_crybone_controller_at_time(
-                    ctrl_chunk, time_tick, default_local=default_local
-                )
+            local_m = _evaluate_crybone_controller_at_time(
+                ctrl_chunk, time_tick, default_local=default_local, bone_name=bone_name, evaluator_mode=evaluator_mode
+            )
         parent_name = item["parent_name"]
         if parent_name and parent_name in pose:
             world_m = pose[parent_name]["world"] @ local_m
@@ -1258,7 +1212,7 @@ def _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick):
     return pose
 
 
-def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame=None, action=None):
+def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame=None, action=None, evaluator_mode="DEFAULT"):
     if arm_obj is None or arm_obj.pose is None:
         return
 
@@ -1271,7 +1225,7 @@ def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame
         try:
             bind_pose = _build_cry_bind_pose(geom_archive, arm_obj=arm_obj)
             if bind_pose:
-                cry_pose = _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick)
+                cry_pose = _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick, evaluator_mode=evaluator_mode)
         except Exception:
             bind_pose = None
             cry_pose = None
@@ -1290,17 +1244,19 @@ def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame
             continue
         ctrl_chunk = ctrl_by_bone[bone_name]
         if cry_pose and bone_name in cry_pose:
-            local_m = cry_pose[bone_name]["local"].copy()
-            world_m = None
+            cry_local = cry_pose[bone_name]["local"].copy()
+            cry_bind_local = cry_pose[bone_name]["bind_local"].copy()
+            blender_rest_local = _bone_rest_local_matrix(pbone)
+            try:
+                local_delta = cry_bind_local.inverted_safe() @ cry_local
+                local_m = blender_rest_local @ local_delta
+            except Exception:
+                local_m = cry_local
         else:
             local_m = _evaluate_crybone_controller_at_time(
-                ctrl_chunk, time_tick, default_local=_bone_rest_local_matrix(pbone)
+                ctrl_chunk, time_tick, default_local=_bone_rest_local_matrix(pbone), bone_name=bone_name, evaluator_mode=evaluator_mode
             )
-            world_m = None
-        if world_m is not None:
-            _set_pose_from_world_matrix(pbone, world_m)
-        else:
-            _set_pose_from_anim_pose_matrix(pbone, local_m)
+        _set_pose_from_anim_pose_matrix(pbone, local_m)
 
     try:
         bpy.context.view_layer.update()
@@ -1321,7 +1277,7 @@ def _apply_crybone_pose_at_time(arm_obj, ctrl_by_bone, time_tick, keyframe_frame
                 pbone.keyframe_insert(data_path="scale", frame=keyframe_frame)
 
 
-def _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame):
+def _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame, evaluator_mode="DEFAULT"):
     focus = {
         "root", "root1", "weapon", "spitfire", "local_hs_weapon", "reload",
         "bone18", "bone19", "bone20",
@@ -1335,7 +1291,7 @@ def _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame):
             continue
         ctrl_chunk = ctrl_by_bone[bone_name]
         local_m = _evaluate_crybone_controller_at_time(
-            ctrl_chunk, time_tick, default_local=_bone_rest_local_matrix(pbone)
+            ctrl_chunk, time_tick, default_local=_bone_rest_local_matrix(pbone), bone_name=bone_name, evaluator_mode=evaluator_mode
         )
         l_loc, l_rot, _ = local_m.decompose()
         w_loc = pbone.matrix.translation.copy()
@@ -1349,7 +1305,7 @@ def _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame):
         )
 
 
-def _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame):
+def _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame, evaluator_mode="DEFAULT"):
     print(f"[CAF-MATRIX] frame={frame:.3f} tick={time_tick}")
     for bone_name in ("root1", "weapon", "reload"):
         pbone = arm_obj.pose.bones.get(bone_name)
@@ -1358,7 +1314,7 @@ def _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame):
             continue
         rest_local = _bone_rest_local_matrix(pbone)
         eval_local = _evaluate_crybone_controller_at_time(
-            ctrl_chunk, time_tick, default_local=rest_local
+            ctrl_chunk, time_tick, default_local=rest_local, bone_name=bone_name, evaluator_mode=evaluator_mode
         )
         basis_delta = rest_local.inverted() @ eval_local
         print(f"[CAF-MATRIX] bone={bone_name} rest_local={_fmt_matrix4(rest_local)}")
@@ -1624,9 +1580,8 @@ def _choose_preview_skinning_mode(obj, mesh_chunk, geom_archive, bind_pose, obj_
         return "delta_col"
     ranked.sort()
     best_error, best_mode = ranked[0]
-    forced_mode = "delta_col" if any(mode == "delta_col" for _, mode in ranked) else best_mode
-    print(f"[CRYSKIN] best_mode={best_mode} forced_mode={forced_mode} bind_mse={best_error:.8f} all={[(m, round(errors[m] / counts[m], 8)) for m in modes if counts[m] > 0]}")
-    return forced_mode
+    print(f"[CRYSKIN] best_mode={best_mode} bind_mse={best_error:.8f} all={[(m, round(errors[m] / counts[m], 8)) for m in modes if counts[m] > 0]}")
+    return best_mode
 
 
 def _skin_mesh_vertices_from_cry_pose(obj, mesh_chunk, geom_archive, bind_pose, cry_pose, skin_mode="delta_col"):
@@ -1682,7 +1637,7 @@ def _skin_mesh_vertices_from_cry_pose(obj, mesh_chunk, geom_archive, bind_pose, 
     return coords
 
 
-def _debug_compare_blender_vs_cry_skin(arm_obj, geom_archive, bind_pose, cry_pose):
+def _debug_compare_blender_vs_cry_skin(arm_obj, geom_archive, bind_pose, cry_pose, skin_mode="delta_col"):
     if arm_obj is None or geom_archive is None or not bind_pose or not cry_pose:
         return
     depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -1690,7 +1645,7 @@ def _debug_compare_blender_vs_cry_skin(arm_obj, geom_archive, bind_pose, cry_pos
         mesh_chunk = _geom_mesh_chunk_by_object(obj, geom_archive)
         if mesh_chunk is None or not mesh_chunk.physique:
             continue
-        predicted = _skin_mesh_vertices_from_cry_pose(obj, mesh_chunk, geom_archive, bind_pose, cry_pose, skin_mode="delta_col")
+        predicted = _skin_mesh_vertices_from_cry_pose(obj, mesh_chunk, geom_archive, bind_pose, cry_pose, skin_mode=skin_mode)
         if not predicted:
             continue
         try:
@@ -1934,7 +1889,23 @@ def _bake_cry_maxspace_to_meshes(arm_obj, geom_archive, ctrl_by_bone, ticks_per_
         mesh_chunk = _geom_mesh_chunk_by_object(obj, geom_archive)
         if mesh_chunk is None or not mesh_chunk.physique:
             continue
-
+        node_chunk = geom_archive.get_node(mesh_chunk.header.chunk_id) if mesh_chunk.header else None
+        if node_chunk is not None and node_chunk.trans_matrix:
+            chunk_world = cry_matrix_to_blender(node_chunk.trans_matrix)
+        else:
+            chunk_world = obj.matrix_world.copy()
+        arm_world = arm_obj.matrix_world.copy()
+        obj_to_arm = arm_world.inverted_safe() @ chunk_world
+        arm_to_obj = chunk_world.inverted_safe() @ arm_world
+        bind_bl = _convert_raw_pose_to_blender_pose(bind_pose_raw, arm_obj)
+        skin_mode = _choose_preview_skinning_mode(
+            obj,
+            mesh_chunk,
+            geom_archive,
+            bind_bl,
+            obj_to_arm=obj_to_arm,
+            arm_to_obj=arm_to_obj,
+        )
         _remove_cry_preview_shape_keys(obj)
         _ensure_basis_shape_key(obj)
 
@@ -1953,9 +1924,8 @@ def _bake_cry_maxspace_to_meshes(arm_obj, geom_archive, ctrl_by_bone, ticks_per_
             frame = (time_tick + time_offset_ticks) / ticks_per_frame
             raw_pose = _evaluate_cry_skeleton_pose_raw(bind_pose_raw, ctrl_by_bone, time_tick)
             pose_bl = _convert_raw_pose_to_blender_pose(raw_pose, arm_obj)
-            bind_bl = _convert_raw_pose_to_blender_pose(bind_pose_raw, arm_obj)
             coords = _skin_mesh_vertices_from_cry_pose(
-                obj, mesh_chunk, geom_archive, bind_bl, pose_bl, skin_mode="delta_col"
+                obj, mesh_chunk, geom_archive, bind_bl, pose_bl, skin_mode=skin_mode
             )
             if not coords:
                 continue
@@ -1981,7 +1951,7 @@ def _bake_cry_maxspace_to_meshes(arm_obj, geom_archive, ctrl_by_bone, ticks_per_
             pose0 = _evaluate_cry_skeleton_pose_raw(bind_pose_raw, ctrl_by_bone, sorted_ticks[0])
             pose0_bl = _convert_raw_pose_to_blender_pose(pose0, arm_obj)
             bind_bl = _convert_raw_pose_to_blender_pose(bind_pose_raw, arm_obj)
-            _debug_compare_blender_vs_cry_skin(arm_obj, geom_archive, bind_bl, pose0_bl)
+            _debug_compare_blender_vs_cry_skin(arm_obj, geom_archive, bind_bl, pose0_bl, skin_mode=skin_mode)
         except Exception:
             pass
     return baked_any
@@ -2061,10 +2031,22 @@ def _bake_cry_preview_to_meshes(arm_obj, geom_archive, ctrl_by_bone, ticks_per_f
     return baked_any
 
 
+def _normalize_playback_mode(playback_mode):
+    if isinstance(playback_mode, bool):
+        return "PROXY" if playback_mode else "ARMATURE"
+    mode = str(playback_mode or "ARMATURE").strip().upper()
+    if mode not in {"ARMATURE", "PROXY", "MAXSPACE", "RAWMAX"}:
+        mode = "ARMATURE"
+    return mode
+
+
 def _apply_crybone_controllers(
-    arm_obj, geom_archive, ctrl_chunks, ctrl_to_bone, ticks_per_frame, time_offset_ticks=0, debug_caf=False, action=None
+    arm_obj, geom_archive, ctrl_chunks, ctrl_to_bone, ticks_per_frame, time_offset_ticks=0,
+    debug_caf=False, action=None, playback_mode="ARMATURE"
 ):
     _clear_cry_proxy_data(arm_obj)
+    playback_mode = _normalize_playback_mode(playback_mode)
+    evaluator_mode = "RAWMAX" if playback_mode == "RAWMAX" else "DEFAULT"
 
     ctrl_by_bone = {}
     key_times = set()
@@ -2082,6 +2064,45 @@ def _apply_crybone_controllers(
 
     if not ctrl_by_bone or not key_times:
         return False
+
+    if playback_mode == "PROXY":
+        bind_pose_raw = _build_cry_bind_pose_raw(geom_archive)
+        if bind_pose_raw:
+            proxies = _build_cry_proxy_hierarchy(arm_obj, bind_pose_raw)
+            sorted_ticks = _animate_cry_proxies(
+                arm_obj, proxies, ctrl_by_bone, ticks_per_frame, time_offset_ticks=time_offset_ticks
+            )
+            _drive_armature_from_proxies(arm_obj, proxies)
+            baked_preview = _bake_cry_proxy_to_meshes(
+                arm_obj,
+                geom_archive,
+                bind_pose_raw,
+                proxies,
+                sorted_ticks,
+                ticks_per_frame,
+                time_offset_ticks,
+                getattr(action, "name", "CRYPOSE_PROXY"),
+                debug_caf=debug_caf,
+            )
+            if debug_caf:
+                print(f"[CRYPOSE] proxy_first baked_preview={baked_preview} proxy_count={len(proxies)}")
+            _reset_pose_bones_to_rest(arm_obj, ctrl_by_bone.keys())
+            return baked_preview or True
+
+    if playback_mode == "MAXSPACE":
+        baked_preview = _bake_cry_maxspace_to_meshes(
+            arm_obj,
+            geom_archive,
+            ctrl_by_bone,
+            ticks_per_frame,
+            time_offset_ticks,
+            getattr(action, "name", "CRYPOSE_MAXSPACE"),
+            debug_caf=debug_caf,
+        )
+        if debug_caf:
+            print(f"[CRYPOSE] maxspace baked_preview={baked_preview} ctrl_count={len(ctrl_by_bone)}")
+        _reset_pose_bones_to_rest(arm_obj, ctrl_by_bone.keys())
+        return baked_preview or True
 
     bind_pose = _build_cry_bind_pose(geom_archive, arm_obj=arm_obj)
     if debug_caf:
@@ -2115,15 +2136,16 @@ def _apply_crybone_controllers(
             time_tick,
             keyframe_frame=frame,
             action=action,
+            evaluator_mode=evaluator_mode,
         )
         if debug_caf and (idx < 5 or idx == mid_index or idx == last_index or (target_tick is not None and int(time_tick) == int(target_tick))):
-            _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame)
+            _debug_log_crybone_frame(arm_obj, ctrl_by_bone, time_tick, frame, evaluator_mode=evaluator_mode)
         if debug_caf and (idx == 0 or idx == mid_index or idx == last_index or (target_tick is not None and int(time_tick) == int(target_tick))):
-            _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame)
+            _debug_log_crybone_matrices(arm_obj, ctrl_by_bone, time_tick, frame, evaluator_mode=evaluator_mode)
             _debug_log_v827_root_keys(ctrl_by_bone, time_tick, frame)
             if bind_pose:
                 _debug_log_cry_pose(bind_pose, ctrl_by_bone, time_tick, frame)
-                debug_cry_pose = _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick)
+                debug_cry_pose = _evaluate_cry_skeleton_pose(bind_pose, ctrl_by_bone, time_tick, evaluator_mode=evaluator_mode)
                 _debug_compare_blender_vs_cry_skin(arm_obj, geom_archive, bind_pose, debug_cry_pose)
 
     _reset_pose_bones_to_rest(arm_obj, ctrl_by_bone.keys())
@@ -2794,23 +2816,25 @@ def build_armature(archive, collection, asset_root_obj=None, apply_asset_transfo
         mx = init_mats.get(bid)
         if mx is not None:
             try:
-                head = mx.translation.copy()
-                tail_dir = mx.col[1].xyz.copy()
-                if tail_dir.length <= 1e-8:
-                    tail_dir = mathutils.Vector((0.0, 1.0, 0.0))
-
-                # Use the bind matrix orientation directly instead of inferring
-                # tail from children. Child-averaging changes the edit-bone rest
-                # axes and breaks CAF local-space playback.
                 bone_len = 0.05 * INCHES_TO_METERS
-                tail = head + tail_dir.normalized() * bone_len
-
-                eb.head = head
-                eb.tail = tail
-
-                local_z = mx.col[2].xyz.copy()
-                if local_z.length > 1e-8:
-                    eb.align_roll(local_z.normalized())
+                eb.head = mathutils.Vector((0.0, 0.0, 0.0))
+                eb.tail = mathutils.Vector((0.0, bone_len, 0.0))
+                try:
+                    eb.matrix = mx.copy()
+                    eb.length = bone_len
+                except Exception:
+                    head = mx.translation.copy()
+                    # Fallback path for Blender builds that reject direct edit-bone
+                    # matrix assignment: reconstruct the same basis manually.
+                    tail_dir = mx.col[1].xyz.copy()
+                    if tail_dir.length <= 1e-8:
+                        tail_dir = mathutils.Vector((0.0, 1.0, 0.0))
+                    tail = head + tail_dir.normalized() * bone_len
+                    eb.head = head
+                    eb.tail = tail
+                    local_up = mx.col[2].xyz.copy()
+                    if local_up.length > 1e-8:
+                        eb.align_roll(local_up.normalized())
             except Exception as e:
                 print(f"[CGF] Bone matrix error {bname}: {e}")
         eb_map[bid] = eb
@@ -2912,7 +2936,7 @@ def build_shape_keys(obj, mesh_chunk, archive):
 
 # ── Animation ─────────────────────────────────────────────────────────────────
 
-def apply_animation(arm_obj, geom_archive, anim_archive, action_name="Action", debug_caf=False):
+def apply_animation(arm_obj, geom_archive, anim_archive, action_name="Action", debug_caf=False, playback_mode="ARMATURE"):
     """
     Apply controller chunks from anim_archive to the armature.
     Ported from CryImporter-scenebuilder.ms createController826/827 + addAnim.
@@ -3009,7 +3033,7 @@ def apply_animation(arm_obj, geom_archive, anim_archive, action_name="Action", d
     crybone_baked = False
     if crybone_chunks:
         _restore_mesh_armature_playback(arm_obj)
-        _apply_crybone_controllers(
+        crybone_baked = _apply_crybone_controllers(
             arm_obj,
             geom_archive,
             crybone_chunks,
@@ -3018,6 +3042,7 @@ def apply_animation(arm_obj, geom_archive, anim_archive, action_name="Action", d
             time_offset_ticks=time_offset_ticks,
             debug_caf=debug_caf,
             action=action,
+            playback_mode=playback_mode,
         )
 
     for ctrl_chunk in anim_archive.controller_chunks:
@@ -3502,7 +3527,7 @@ def _ensure_armature(operator, context, anim_filepath):
     return arm_obj, archive
 
 
-def load_caf(operator, context, filepath, append=True, debug_caf=False):
+def load_caf(operator, context, filepath, append=True, debug_caf=False, playback_mode="ARMATURE"):
     """Import a CAF animation file. Auto-imports CGF if no armature in scene."""
 
     arm_obj, auto_archive = _ensure_armature(operator, context, filepath)
@@ -3525,7 +3550,7 @@ def load_caf(operator, context, filepath, append=True, debug_caf=False):
     print(f"[CGF] Controllers: {len(anim_archive.controller_chunks)}")
 
     action_name = os.path.splitext(os.path.basename(filepath))[0]
-    apply_animation(arm_obj, geom_archive, anim_archive, action_name, debug_caf=debug_caf)
+    apply_animation(arm_obj, geom_archive, anim_archive, action_name, debug_caf=debug_caf, playback_mode=playback_mode)
     try:
         context.scene.frame_set(context.scene.frame_start)
     except Exception:
@@ -3535,7 +3560,7 @@ def load_caf(operator, context, filepath, append=True, debug_caf=False):
     return {'FINISHED'}
 
 
-def load_cal(operator, context, filepath, debug_caf=False):
+def load_cal(operator, context, filepath, debug_caf=False, playback_mode="ARMATURE"):
     """Import all animations from a CAL file. Auto-imports CGF if needed."""
 
     arm_obj, auto_archive = _ensure_armature(operator, context, filepath)
@@ -3564,7 +3589,7 @@ def load_cal(operator, context, filepath, debug_caf=False):
         except Exception as e:
             print(f"[CGF] Failed {caf_path}: {e}"); continue
 
-        apply_animation(arm_obj, geom_archive, anim_archive, rec.name, debug_caf=debug_caf)
+        apply_animation(arm_obj, geom_archive, anim_archive, rec.name, debug_caf=debug_caf, playback_mode=playback_mode)
         try:
             context.scene.frame_set(context.scene.frame_start)
         except Exception:
