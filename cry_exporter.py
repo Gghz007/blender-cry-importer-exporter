@@ -518,9 +518,36 @@ def extract_materials(obj):
                                         t.image.name
                                     )
 
+        # Build a robust Cry material identity for export.
+        # If explicit Cry metadata is missing (common on brand-new Blender materials),
+        # fall back to safe visible defaults instead of exporting a bare name.
+        source_name = mat.get('cgf_source_name', mat.name)
+        full_name = mat.get('cgf_full_name')
+        shader_name = mat.get('cgf_shader_name', '')
+        surface_name = mat.get('cgf_surface_name', '')
+
+        if not shader_name and hasattr(mat, "cry"):
+            try:
+                cry = mat.cry
+                if getattr(cry, "shader_preset", "") == "custom":
+                    shader_name = (getattr(cry, "shader_custom", "") or "").strip()
+                else:
+                    shader_name = (getattr(cry, "shader_preset", "") or "").strip()
+                surface_name = surface_name or (getattr(cry, "surface", "") or "").strip()
+            except Exception:
+                pass
+
+        if not shader_name:
+            shader_name = "TemplModelCommon"
+        if not surface_name:
+            surface_name = "mat_default"
+
+        if not full_name:
+            full_name = _build_cgf_mat_name(source_name, shader_name, surface_name)
+
         result.append({
-            'name':        mat.get('cgf_full_name', mat.name),
-            'source_name': mat.get('cgf_source_name', mat.name),
+            'name':        full_name,
+            'source_name': source_name,
             'chunk_id':    int(mat.get('cgf_chunk_id', -1)),
             'diffuse':     diffuse,
             'specular':    specular,
@@ -1348,9 +1375,14 @@ def export_cgf_scene(operator, context, filepath,
                         if override else
                         (src_mat.tex_detail.name if src_mat.tex_detail else '')
                     )
+                    material_full_name = (
+                        (override.get('name') or full_name)
+                        if override else
+                        full_name
+                    )
                     data, ver, _ = build_material_chunk(
                         cid,
-                        override.get('source_name', src_mat.name) if override else src_mat.name,
+                        material_full_name,
                         mat_type=1,
                         diffuse=override.get('diffuse', src_mat.diffuse) if override else src_mat.diffuse,
                         specular=override.get('specular', src_mat.specular) if override else src_mat.specular,
@@ -1372,7 +1404,7 @@ def export_cgf_scene(operator, context, filepath,
             if cid in written_ids:
                 continue
             data, ver, _ = build_material_chunk(
-                cid, mat.get('source_name', mat['name']),
+                cid, mat.get('name', mat.get('source_name', 'material')),
                 mat_type=1,
                 diffuse=mat['diffuse'],
                 specular=mat['specular'],
